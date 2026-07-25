@@ -5,3 +5,4 @@ httpx==0.25.1
 psutil==5.9.6
 pyTelegramBotAPI
 python-multipart
+jinja2
