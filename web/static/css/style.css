@@ -1,0 +1,184 @@
+:root {
+    --honey: #f5a623;
+    --honey-dark: #d48f1a;
+    --honey-light: #fdf3e0;
+    --dark: #2c2c2c;
+    --light: #fdf8f0;
+}
+
+* { margin: 0; padding: 0; box-sizing: border-box; }
+
+body {
+    font-family: 'Segoe UI', Tahoma, sans-serif;
+    background: var(--light);
+    color: var(--dark);
+    min-height: 100vh;
+}
+
+.header {
+    background: linear-gradient(135deg, var(--honey), var(--honey-dark));
+    padding: 40px 20px;
+    text-align: center;
+    clip-path: polygon(0 0, 100% 0, 100% 80%, 50% 100%, 0 80%);
+    margin-bottom: 40px;
+    position: relative;
+}
+.header h1 {
+    font-size: 3.5rem;
+    color: #fff;
+    text-shadow: 2px 2px 4px rgba(0,0,0,0.3);
+}
+.header p {
+    color: rgba(255,255,255,0.9);
+    font-size: 1.2rem;
+}
+
+.login-container {
+    display: flex;
+    justify-content: center;
+    align-items: center;
+    min-height: 100vh;
+    background: linear-gradient(135deg, var(--honey-light), #fff);
+}
+.login-box {
+    background: #fff;
+    padding: 40px;
+    border-radius: 20px;
+    box-shadow: 0 20px 60px rgba(245, 166, 35, 0.2);
+    width: 100%;
+    max-width: 400px;
+    border: 2px solid var(--honey);
+}
+.login-header {
+    font-size: 2rem;
+    font-weight: bold;
+    color: var(--honey-dark);
+    text-align: center;
+    margin-bottom: 30px;
+}
+.login-box input {
+    width: 100%;
+    padding: 12px 16px;
+    margin-bottom: 16px;
+    border: 2px solid #ddd;
+    border-radius: 10px;
+    font-size: 1rem;
+    transition: border-color 0.3s;
+}
+.login-box input:focus {
+    border-color: var(--honey);
+    outline: none;
+}
+.login-box button {
+    width: 100%;
+    padding: 12px;
+    background: var(--honey);
+    border: none;
+    border-radius: 10px;
+    color: #fff;
+    font-size: 1.1rem;
+    font-weight: bold;
+    cursor: pointer;
+    transition: background 0.3s;
+}
+.login-box button:hover {
+    background: var(--honey-dark);
+}
+
+.container {
+    max-width: 1200px;
+    margin: 0 auto;
+    padding: 20px;
+}
+
+.stats-grid {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
+    gap: 20px;
+    margin-bottom: 40px;
+}
+.stat-card {
+    background: #fff;
+    padding: 20px;
+    border-radius: 16px;
+    box-shadow: 0 4px 15px rgba(0,0,0,0.08);
+    border-left: 4px solid var(--honey);
+    text-align: center;
+}
+.stat-card h3 {
+    color: #888;
+    font-size: 0.9rem;
+    text-transform: uppercase;
+    letter-spacing: 1px;
+    margin-bottom: 8px;
+}
+.stat-card p {
+    font-size: 2rem;
+    font-weight: bold;
+    color: var(--dark);
+}
+
+.hex-grid {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 20px;
+    justify-content: center;
+    margin-bottom: 40px;
+}
+.hex-card {
+    width: 140px;
+    height: 160px;
+    background: linear-gradient(135deg, var(--honey), var(--honey-dark));
+    clip-path: polygon(50% 0%, 100% 25%, 100% 75%, 50% 100%, 0% 75%, 0% 25%);
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    color: #fff;
+    font-size: 1rem;
+    font-weight: bold;
+    transition: all 0.3s cubic-bezier(0.175, 0.885, 0.32, 1.275);
+    cursor: pointer;
+    box-shadow: 0 10px 25px rgba(245, 166, 35, 0.3);
+    text-shadow: 1px 1px 2px rgba(0,0,0,0.2);
+    text-align: center;
+    padding: 10px;
+}
+.hex-card:hover {
+    transform: scale(1.08) translateY(-5px);
+    box-shadow: 0 20px 40px rgba(245, 166, 35, 0.4);
+}
+.hex-card:active {
+    transform: scale(0.95);
+}
+.hex-card.active {
+    border: 3px solid #fff;
+    box-shadow: 0 0 30px rgba(245, 166, 35, 0.6);
+}
+
+table {
+    width: 100%;
+    border-collapse: collapse;
+    background: #fff;
+    border-radius: 16px;
+    overflow: hidden;
+    box-shadow: 0 4px 15px rgba(0,0,0,0.08);
+}
+th {
+    background: var(--honey);
+    color: #fff;
+    padding: 14px 16px;
+    text-align: left;
+}
+td {
+    padding: 12px 16px;
+    border-bottom: 1px solid #f0f0f0;
+}
+tr:hover td {
+    background: var(--honey-light);
+}
+
+@media (max-width: 600px) {
+    .header h1 { font-size: 2.2rem; }
+    .hex-card { width: 110px; height: 130px; font-size: 0.8rem; }
+    .stats-grid { grid-template-columns: 1fr 1fr; }
+  }
