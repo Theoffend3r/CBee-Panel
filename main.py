@@ -91,7 +91,7 @@ LOGIN_HTML = """
                 <input type="password" id="password" placeholder="رمز عبور" required>
                 <button type="submit">ورود به داشبورد</button>
             </form>
-            <div id="loginError" style="color:red;display:none;"></div>
+            <div id="loginError" style="color:red;display:none;margin-top:10px;"></div>
         </div>
     </div>
     <script>
@@ -99,23 +99,27 @@ LOGIN_HTML = """
         e.preventDefault();
         const username = document.getElementById('username').value;
         const password = document.getElementById('password').value;
+        const errorDiv = document.getElementById('loginError');
+        errorDiv.style.display = 'none';
+        
         try {
-            const res = await fetch('/api/admin/login', {
-                method: 'POST',
-                headers: {'Content-Type': 'application/json'},
-                body: JSON.stringify({username, password})
+            const res = await fetch(`/api/admin/login?username=${encodeURIComponent(username)}&password=${encodeURIComponent(password)}`, {
+                method: 'POST'
             });
+            
             const data = await res.json();
-            if (res.ok) {
+            
+            if (res.ok && data.status === 'ok') {
                 localStorage.setItem('token', data.token);
                 window.location.href = '/dashboard';
             } else {
-                document.getElementById('loginError').textContent = data.detail || 'خطا در ورود';
-                document.getElementById('loginError').style.display = 'block';
+                errorDiv.textContent = data.detail || 'نام کاربری یا رمز عبور اشتباه است';
+                errorDiv.style.display = 'block';
             }
         } catch(err) {
-            document.getElementById('loginError').textContent = 'خطا در ارتباط با سرور';
-            document.getElementById('loginError').style.display = 'block';
+            errorDiv.textContent = 'خطا در ارتباط با سرور';
+            errorDiv.style.display = 'block';
+            console.error('Login error:', err);
         }
     }
     </script>
