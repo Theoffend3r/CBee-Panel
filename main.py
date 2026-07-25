@@ -1,1571 +1,660 @@
 import asyncio
 import json
 import os
+import uuid
+import hashlib
 import secrets
 import time
-import base64
-import hashlib
-import logging
-import re
-import socket
-import struct
-from datetime import datetime, timedelta
-from typing import Dict, List, Optional, Set, Any, Union
-from urllib.parse import quote, unquote
-
-import httpx
 import psutil
-import uvicorn
-from fastapi import FastAPI, Request, Response, WebSocket, WebSocketDisconnect, Depends, HTTPException, Form, Cookie
+from datetime import datetime, timedelta
+from fastapi import FastAPI, Request, Response, WebSocket, WebSocketDisconnect, Form, HTTPException
 from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse
-from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
-from fastapi.middleware.cors import CORSMiddleware
-from fastapi.security import APIKeyCookie
+from fastapi.staticfiles import StaticFiles
+import httpx
+import websockets
+from typing import Dict, List, Optional, Any
+import threading
+import logging
 
-# ==================== تنظیمات اولیه ====================
+# تنظیمات لاگ
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
 
-logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
-logger = logging.getLogger("SLV-Panel")
+# ============ تنظیمات اولیه ============
+app = FastAPI(title="CBee Panel", version="2.0.0")
 
-app = FastAPI(title="SLV Panel", version="2.0", docs_url=None, redoc_url=None)
+# تنظیمات امنیتی
+ADMIN_PASSWORD = os.getenv("ADMIN_PASSWORD", "admin")
+SECRET_KEY = os.getenv("SECRET_KEY", secrets.token_urlsafe(32))
+PORT = int(os.getenv("PORT", 8000))
 
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
-
-# ==================== پیکربندی و ذخیره‌سازی ====================
-
-DATA_FILE = "panel_db.json"
-SECRET_KEY = os.environ.get("SECRET_KEY", secrets.token_hex(32))
-ADMIN_PASSWORD = os.environ.get("ADMIN_PASSWORD", "admin")
-
-# ساختار داده‌ها
-LINKS: Dict[str, dict] = {}
+# دیتابیس درون‌حافظه
+DB_FILE = "panel_db.json"
+LINKS: Dict[str, Dict] = {}
 CUSTOM_ADDRESSES: List[str] = []
-CONFIG: dict = {}
-SESSION_STORE: Dict[str, str] = {}  # session_id -> username
+CONFIG = {
+    "telegram_token": "",
+    "telegram_admin_id": "",
+    "bot_lang": "fa"
+}
+SESSIONS: Dict[str, str] = {}  # session_id -> username
+ACTIVE_WEBSOCKETS: Dict[str, set] = {}
+NOTIFIED_UIDS: set = set()
+BOT_POLLING_TASK: Optional[asyncio.Task] = None
+TELEGRAM_BOT = None
 
+# ============ توابع دیتابیس ============
 def load_db():
+    """بارگذاری دیتابیس از فایل"""
     global LINKS, CUSTOM_ADDRESSES, CONFIG
-    try:
-        if os.path.exists(DATA_FILE):
-            with open(DATA_FILE, "r") as f:
+    if os.path.exists(DB_FILE):
+        try:
+            with open(DB_FILE, 'r', encoding='utf-8') as f:
                 data = json.load(f)
                 LINKS = data.get("links", {})
                 CUSTOM_ADDRESSES = data.get("addresses", [])
-                CONFIG = data.get("config", {})
-                CONFIG.setdefault("telegram_token", "")
-                CONFIG.setdefault("telegram_admin_id", "")
-                CONFIG.setdefault("lang", "fa")
-                logger.info(f"✅ Loaded {len(LINKS)} links and {len(CUSTOM_ADDRESSES)} addresses from {DATA_FILE}")
-        else:
-            logger.info("📄 No existing database found, starting fresh.")
-    except Exception as e:
-        logger.error(f"❌ Error loading database: {e}")
+                CONFIG.update(data.get("config", {}))
+                logger.info(f"✅ دیتابیس بارگذاری شد: {len(LINKS)} کاربر")
+        except Exception as e:
+            logger.error(f"❌ خطا در بارگذاری دیتابیس: {e}")
+    else:
+        # دیتابیس پیش‌فرض
+        LINKS = {}
+        CUSTOM_ADDRESSES = []
+        CONFIG = {"telegram_token": "", "telegram_admin_id": "", "bot_lang": "fa"}
+        save_db()
 
 def save_db():
-    global LINKS, CUSTOM_ADDRESSES, CONFIG
+    """ذخیره دیتابیس در فایل"""
     try:
         data = {
             "links": LINKS,
             "addresses": CUSTOM_ADDRESSES,
             "config": CONFIG
         }
-        with open(DATA_FILE, "w") as f:
-            json.dump(data, f, indent=2)
-        logger.info(f"💾 Saved {len(LINKS)} links and {len(CUSTOM_ADDRESSES)} addresses to {DATA_FILE}")
+        with open(DB_FILE, 'w', encoding='utf-8') as f:
+            json.dump(data, f, indent=2, ensure_ascii=False)
+        return True
     except Exception as e:
-        logger.error(f"❌ Error saving database: {e}")
+        logger.error(f"❌ خطا در ذخیره دیتابیس: {e}")
+        return False
 
-# بارگذاری اولیه
-load_db()
-
-# ==================== توابع کمکی ====================
-
+# ============ توابع کمکی ============
 def hash_password(password: str) -> str:
+    """هش کردن رمز عبور"""
     return hashlib.sha256((password + SECRET_KEY).encode()).hexdigest()
 
 def verify_password(password: str, hashed: str) -> bool:
+    """تایید رمز عبور"""
     return hash_password(password) == hashed
 
-def generate_session_id() -> str:
-    return secrets.token_urlsafe(32)
+def generate_uid() -> str:
+    """تولید UUID جدید"""
+    return str(uuid.uuid4())
+
+def get_domain() -> str:
+    """دریافت دامنه از درخواست"""
+    # در محیط واقعی از request استفاده می‌شود
+    return "cbee-panel.onrender.com"
 
 def get_client_ip(request: Request) -> str:
-    forwarded = request.headers.get("x-forwarded-for")
+    """دریافت IP کلاینت"""
+    forwarded = request.headers.get("X-Forwarded-For")
     if forwarded:
         return forwarded.split(",")[0].strip()
     return request.client.host if request.client else "unknown"
 
-def make_vless_link(uuid: str, domain: str, path: str, remark: str = "") -> str:
-    if not remark:
-        remark = uuid[:8]
-    return f"vless://{uuid}@{domain}:443?encryption=none&security=tls&type=ws&host={domain}&path={quote(path)}&sni={domain}&fp=chrome&alpn=http/1.1#SLV-{remark}"
-
-def make_vmess_link(uuid: str, domain: str, path: str, remark: str = "") -> str:
-    if not remark:
-        remark = uuid[:8]
-    vmess_config = {
-        "v": "2",
-        "ps": f"SLV-{remark}",
-        "add": domain,
-        "port": "443",
-        "id": uuid,
-        "aid": "0",
-        "net": "ws",
-        "type": "none",
-        "host": domain,
-        "path": path,
-        "tls": "tls"
-    }
-    return f"vmess://{base64.b64encode(json.dumps(vmess_config).encode()).decode()}"
-
-def make_trojan_link(uuid: str, domain: str, path: str, remark: str = "") -> str:
-    if not remark:
-        remark = uuid[:8]
-    return f"trojan://{uuid}@{domain}:443?path={quote(path)}&security=tls&type=ws&host={domain}&sni={domain}#SLV-{remark}"
-
-def get_domain() -> str:
-    return os.environ.get("DOMAIN", "slv-panel.onrender.com")
-
-def get_base_url() -> str:
-    return f"https://{get_domain()}"
-
-def format_bytes(bytes_val: int) -> str:
-    if bytes_val == 0:
-        return "0 B"
-    k = 1024
-    sizes = ["B", "KB", "MB", "GB", "TB"]
-    i = 0
-    while bytes_val >= k and i < len(sizes) - 1:
-        bytes_val /= k
-        i += 1
-    return f"{bytes_val:.2f} {sizes[i]}"
-
-def format_date(date_str: Optional[str]) -> str:
-    if not date_str:
-        return "بدون انقضا"
-    try:
-        d = datetime.fromisoformat(date_str)
-        return d.strftime("%Y/%m/%d %H:%M")
-    except:
-        return date_str
-
-def count_connections_for_link(uid: str) -> int:
-    if uid not in ws_connections:
-        return 0
-    return len(ws_connections[uid])
-
-def close_connections_for_link(uid: str):
-    if uid in ws_connections:
-        for conn_id, conn_data in list(ws_connections[uid].items()):
-            try:
-                asyncio.create_task(conn_data["ws"].close(code=1000, reason="Link deleted"))
-            except:
-                pass
-        ws_connections[uid].clear()
-        del ws_connections[uid]
-
-# ==================== احراز هویت ====================
-
-async def get_current_user(session_id: str = Cookie(None)):
-    if not session_id or session_id not in SESSION_STORE:
-        return None
-    return SESSION_STORE.get(session_id)
-
-async def require_admin(user: str = Depends(get_current_user)):
-    if not user:
-        raise HTTPException(status_code=401, detail="Not authenticated")
-    return user
-
-# ==================== مسیرهای API ====================
-
-@app.post("/api/login")
-async def api_login(request: Request, username: str = Form("admin"), password: str = Form(...)):
-    if username != "admin":
-        raise HTTPException(status_code=401, detail="Invalid credentials")
-    
-    if not verify_password(password, hash_password(ADMIN_PASSWORD)):
-        raise HTTPException(status_code=401, detail="Invalid credentials")
-    
-    session_id = generate_session_id()
-    SESSION_STORE[session_id] = "admin"
-    
-    response = JSONResponse({"status": "ok", "message": "Login successful"})
-    response.set_cookie(key="session_id", value=session_id, httponly=True, max_age=3600*24*7)
-    return response
-
-@app.post("/api/logout")
-async def api_logout(session_id: str = Cookie(None)):
-    if session_id and session_id in SESSION_STORE:
-        del SESSION_STORE[session_id]
-    response = JSONResponse({"status": "ok"})
-    response.delete_cookie("session_id")
-    return response
-
-@app.get("/api/me")
-async def api_me(user: str = Depends(get_current_user)):
-    if not user:
-        raise HTTPException(status_code=401, detail="Not authenticated")
-    return {"username": "admin"}
-
-@app.post("/api/change-password")
-async def api_change_password(current: str = Form(...), new: str = Form(...), user: str = Depends(require_admin)):
-    global ADMIN_PASSWORD
-    if not verify_password(current, hash_password(ADMIN_PASSWORD)):
-        raise HTTPException(status_code=400, detail="Current password is incorrect")
-    
-    ADMIN_PASSWORD = new
-    save_db()
-    return {"status": "ok", "message": "Password changed successfully"}
-
-# ==================== مدیریت اینباندها ====================
-
-@app.get("/api/links")
-async def api_get_links(user: str = Depends(require_admin)):
-    return {"links": LINKS}
-
-@app.post("/api/links")
-async def api_create_link(
-    name: str = Form(...),
-    limit_gb: int = Form(0),
-    days: int = Form(30),
-    max_ips: int = Form(0),
-    protocol: str = Form("vless"),
-    user: str = Depends(require_admin)
-):
-    if not name or not re.match(r'^[a-zA-Z0-9_\-]+$', name):
-        raise HTTPException(status_code=400, detail="Invalid name. Use only English letters, numbers, underscore or dash.")
-    
-    if name in LINKS:
-        raise HTTPException(status_code=400, detail="Name already exists.")
-    
-    uid = str(uuid.uuid4())
-    path = f"/ws/{uid}"
-    
-    expires_at = None
-    if days > 0:
-        expires_at = (datetime.now() + timedelta(days=days)).isoformat()
-    
-    LINKS[name] = {
-        "uid": uid,
-        "name": name,
-        "path": path,
-        "limit": limit_gb * 1024 * 1024 * 1024 if limit_gb > 0 else 0,
-        "used": 0,
-        "expires_at": expires_at,
-        "max_ips": max_ips,
-        "active": True,
-        "created_at": datetime.now().isoformat(),
-        "remark": name,
-        "protocol": protocol
-    }
-    
-    save_db()
-    
-    domain = get_domain()
-    
-    if protocol == "vless":
-        share_link = make_vless_link(uid, domain, path, name)
-    elif protocol == "vmess":
-        share_link = make_vmess_link(uid, domain, path, name)
-    elif protocol == "trojan":
-        share_link = make_trojan_link(uid, domain, path, name)
-    else:
-        share_link = make_vless_link(uid, domain, path, name)
-    
-    sub_link = f"{get_base_url()}/sub/{uid}"
-    
-    return {
-        "status": "ok",
-        "link": LINKS[name],
-        "share_link": share_link,
-        "sub": sub_link
-    }
-
-@app.patch("/api/links/{name}")
-async def api_update_link(
-    name: str,
-    active: Optional[bool] = Form(None),
-    limit_gb: Optional[int] = Form(None),
-    max_ips: Optional[int] = Form(None),
-    days: Optional[int] = Form(None),
-    reset_usage: Optional[bool] = Form(False),
-    user: str = Depends(require_admin)
-):
-    if name not in LINKS:
-        raise HTTPException(status_code=404, detail="Link not found")
-    
-    link = LINKS[name]
-    
-    if active is not None:
-        link["active"] = active
-    
-    if limit_gb is not None:
-        link["limit"] = limit_gb * 1024 * 1024 * 1024
-    
-    if max_ips is not None:
-        link["max_ips"] = max_ips
-    
-    if days is not None:
-        if days > 0:
-            link["expires_at"] = (datetime.now() + timedelta(days=days)).isoformat()
-        else:
-            link["expires_at"] = None
-    
-    if reset_usage:
-        link["used"] = 0
-    
-    save_db()
-    return {"status": "ok", "link": link}
-
-@app.delete("/api/links/{name}")
-async def api_delete_link(name: str, user: str = Depends(require_admin)):
-    if name not in LINKS:
-        raise HTTPException(status_code=404, detail="Link not found")
-    
-    uid = LINKS[name]["uid"]
-    close_connections_for_link(uid)
-    
-    del LINKS[name]
-    save_db()
-    return {"status": "ok"}
-
-@app.get("/sub/{uid}")
-async def get_subscription(uid: str):
-    link_name = None
-    link_data = None
-    for name, data in LINKS.items():
-        if data["uid"] == uid:
-            link_name = name
-            link_data = data
-            break
-    
-    if not link_data:
-        raise HTTPException(status_code=404, detail="Not found")
-    
-    domain = get_domain()
-    path = link_data["path"]
-    protocol = link_data.get("protocol", "vless")
-    
-    if protocol == "vless":
-        vless_link = make_vless_link(uid, domain, path, link_name)
-        config = vless_link
-    elif protocol == "vmess":
-        vmess_link = make_vmess_link(uid, domain, path, link_name)
-        config = vmess_link
-    elif protocol == "trojan":
-        trojan_link = make_trojan_link(uid, domain, path, link_name)
-        config = trojan_link
-    else:
-        config = make_vless_link(uid, domain, path, link_name)
-    
-    encoded = base64.b64encode(config.encode()).decode()
-    return Response(content=encoded, media_type="text/plain")
-
-# ==================== مدیریت آدرس‌های تمیز ====================
-
-@app.get("/api/addresses")
-async def api_get_addresses(user: str = Depends(require_admin)):
-    return {"addresses": CUSTOM_ADDRESSES}
-
-@app.post("/api/addresses")
-async def api_add_address(address: str = Form(...), user: str = Depends(require_admin)):
-    if not address or len(address) < 3:
-        raise HTTPException(status_code=400, detail="Invalid address")
-    
-    if address in CUSTOM_ADDRESSES:
-        raise HTTPException(status_code=400, detail="Address already exists")
-    
-    CUSTOM_ADDRESSES.append(address)
-    save_db()
-    return {"status": "ok", "addresses": CUSTOM_ADDRESSES}
-
-@app.delete("/api/addresses/{index}")
-async def api_delete_address(index: int, user: str = Depends(require_admin)):
-    if index < 0 or index >= len(CUSTOM_ADDRESSES):
-        raise HTTPException(status_code=404, detail="Address not found")
-    
-    del CUSTOM_ADDRESSES[index]
-    save_db()
-    return {"status": "ok"}
-
-@app.delete("/api/addresses")
-async def api_delete_all_addresses(user: str = Depends(require_admin)):
-    CUSTOM_ADDRESSES.clear()
-    save_db()
-    return {"status": "ok"}
-
-# ==================== تنظیمات ====================
-
-@app.get("/api/settings")
-async def api_get_settings(user: str = Depends(require_admin)):
-    return {
-        "telegram_token": CONFIG.get("telegram_token", ""),
-        "telegram_admin_id": CONFIG.get("telegram_admin_id", ""),
-        "lang": CONFIG.get("lang", "fa")
-    }
-
-@app.post("/api/settings")
-async def api_update_settings(
-    telegram_token: Optional[str] = Form(None),
-    telegram_admin_id: Optional[str] = Form(None),
-    lang: Optional[str] = Form(None),
-    user: str = Depends(require_admin)
-):
-    if telegram_token is not None:
-        CONFIG["telegram_token"] = telegram_token
-    if telegram_admin_id is not None:
-        CONFIG["telegram_admin_id"] = telegram_admin_id
-    if lang is not None and lang in ["en", "fa"]:
-        CONFIG["lang"] = lang
-    
-    save_db()
-    asyncio.create_task(restart_telegram_bot())
-    
-    return {"status": "ok"}
-
-# ==================== آمار و سلامت ====================
-
-@app.get("/stats")
-async def get_stats(user: str = Depends(require_admin)):
-    cpu_percent = psutil.cpu_percent()
-    memory = psutil.virtual_memory()
-    uptime_seconds = time.time() - psutil.boot_time()
-    
-    total_traffic = sum(link.get("used", 0) for link in LINKS.values())
-    active_links = sum(1 for link in LINKS.values() if link.get("active", True))
-    total_connections = sum(count_connections_for_link(link.get("uid", "")) for link in LINKS.values())
-    
-    return {
-        "cpu": cpu_percent,
-        "memory": memory.percent,
-        "memory_used": memory.used,
-        "memory_total": memory.total,
-        "uptime": uptime_seconds,
-        "total_traffic": total_traffic,
-        "active_links": active_links,
-        "total_links": len(LINKS),
-        "active_connections": total_connections
-    }
-
-@app.get("/health")
-async def health_check():
-    return {"status": "ok"}
-
-# ==================== WebSocket Proxy ====================
-
-active_websockets: Dict[str, Set[WebSocket]] = {}
-ws_connections: Dict[str, dict] = {}
-
-async def handle_vless_websocket(websocket: WebSocket, uid: str):
-    client_ip = "unknown"
-    try:
-        forwarded = websocket.headers.get("x-forwarded-for")
-        if forwarded:
-            client_ip = forwarded.split(",")[0].strip()
-        elif websocket.client:
-            client_ip = websocket.client.host
-    except:
-        pass
-    
-    logger.info(f"🔌 WebSocket connection from {client_ip} for UID: {uid}")
-    
-    link_name = None
-    link_data = None
-    for name, data in LINKS.items():
-        if data.get("uid") == uid:
-            link_name = name
-            link_data = data
-            break
-    
-    if not link_data:
-        await websocket.close(code=1000, reason="Link not found")
-        return
-    
-    if not link_data.get("active", True):
-        await websocket.close(code=1008, reason="Inactive")
-        return
-    
-    max_ips = link_data.get("max_ips", 0)
-    if max_ips > 0:
-        conn_count = count_connections_for_link(uid)
-        if conn_count >= max_ips:
-            await websocket.close(code=1008, reason="Max IP limit reached")
-            return
-    
-    if not check_link_quota(link_name):
-        await websocket.close(code=1008, reason="Quota exceeded or expired")
-        return
-    
-    if uid not in ws_connections:
-        ws_connections[uid] = {}
-    ws_connections[uid][id(websocket)] = {
-        "ws": websocket,
-        "client_ip": client_ip,
-        "connected_at": datetime.now().isoformat()
-    }
-    
-    try:
-        await websocket.accept()
-        
-        first_msg = await websocket.receive()
-        if first_msg["type"] != "websocket.receive":
-            await websocket.close(code=1000)
-            return
-        
-        data = first_msg.get("bytes") or (first_msg.get("text") or "").encode()
-        if not data:
-            await websocket.close(code=1000)
-            return
-        
-        try:
-            command, address, port, remaining = parse_vless_header(data)
-        except Exception as e:
-            logger.error(f"VLESS parse error: {e}")
-            await websocket.close(code=1000, reason="Invalid VLESS header")
-            return
-        
-        try:
-            reader, writer = await asyncio.open_connection(address, port)
-        except Exception as e:
-            logger.error(f"Target connection failed: {e}")
-            await websocket.close(code=1000, reason=f"Target: {e}")
-            return
-        
-        if remaining:
-            writer.write(remaining)
-            await writer.drain()
-        
-        task1 = asyncio.create_task(relay_ws_to_tcp(websocket, writer, link_name))
-        task2 = asyncio.create_task(relay_tcp_to_ws(websocket, reader, link_name))
-        
-        await asyncio.gather(task1, task2, return_exceptions=True)
-        
-    except WebSocketDisconnect:
-        logger.info(f"🔌 WebSocket disconnected for UID: {uid}")
-    except Exception as e:
-        logger.error(f"WebSocket error: {e}")
-    finally:
-        if uid in ws_connections and id(websocket) in ws_connections[uid]:
-            del ws_connections[uid][id(websocket)]
-            if not ws_connections[uid]:
-                del ws_connections[uid]
-
-def check_link_quota(link_name: str) -> bool:
-    if link_name not in LINKS:
+def check_auth(request: Request) -> bool:
+    """بررسی احراز هویت"""
+    session_id = request.cookies.get("session_id")
+    if not session_id or session_id not in SESSIONS:
         return False
-    
-    link = LINKS[link_name]
-    
-    if not link.get("active", True):
-        return False
-    
-    limit = link.get("limit", 0)
-    used = link.get("used", 0)
-    if limit > 0 and used >= limit:
-        return False
-    
-    expires_at = link.get("expires_at")
-    if expires_at:
-        try:
-            expiry = datetime.fromisoformat(expires_at)
-            if expiry < datetime.now():
-                return False
-        except:
-            pass
-    
     return True
 
-def update_link_usage(link_name: str, bytes_used: int):
-    if link_name in LINKS:
-        LINKS[link_name]["used"] = LINKS[link_name].get("used", 0) + bytes_used
-        if LINKS[link_name]["used"] % 10000 < bytes_used:
-            save_db()
+def get_current_user(request: Request) -> Optional[str]:
+    """دریافت کاربر فعلی"""
+    session_id = request.cookies.get("session_id")
+    if session_id and session_id in SESSIONS:
+        return SESSIONS[session_id]
+    return None
 
-async def relay_ws_to_tcp(ws: WebSocket, writer: asyncio.StreamWriter, link_name: str):
-    try:
-        while True:
-            msg = await ws.receive()
-            if msg["type"] == "websocket.disconnect":
-                break
-            
-            data = msg.get("bytes") or (msg.get("text") or "").encode()
-            if not data:
-                continue
-            
-            if not check_link_quota(link_name):
-                await ws.close(code=1008, reason="Quota exceeded")
-                break
-            
-            update_link_usage(link_name, len(data))
-            
-            writer.write(data)
-            if writer.transport.get_write_buffer_size() > 256 * 1024:
-                await writer.drain()
-                
-    except (WebSocketDisconnect, Exception) as e:
-        logger.debug(f"WS→TCP relay error: {e}")
-    finally:
-        try:
-            writer.write_eof()
-        except Exception:
-            pass
+def generate_vless_config(uid: str, name: str, domain: str) -> str:
+    """تولید کانفیگ VLESS"""
+    # استفاده از آدرس‌های تمیز
+    if CUSTOM_ADDRESSES:
+        domain = CUSTOM_ADDRESSES[0]
+    
+    return f"vless://{uid}@{domain}:443?encryption=none&security=tls&type=ws&host={domain}&path=/ws/{uid}&sni={domain}&fp=chrome&alpn=http/1.1#CBee-{name}"
 
-async def relay_tcp_to_ws(ws: WebSocket, reader: asyncio.StreamReader, link_name: str):
-    try:
-        while True:
-            data = await reader.read(256 * 1024)
-            if not data:
-                break
-            
-            if not check_link_quota(link_name):
-                await ws.close(code=1008, reason="Quota exceeded")
-                break
-            
-            await ws.send_bytes(data)
-            
-    except (WebSocketDisconnect, Exception) as e:
-        logger.debug(f"TCP→WS relay error: {e}")
+def get_subscription(uid: str) -> str:
+    """تولید لینک اشتراک"""
+    if uid not in LINKS:
+        return ""
+    link = LINKS[uid]
+    domain = get_domain()
+    if CUSTOM_ADDRESSES:
+        domain = CUSTOM_ADDRESSES[0]
+    
+    config = generate_vless_config(uid, link["name"], domain)
+    # تبدیل به Base64
+    import base64
+    return base64.b64encode(config.encode()).decode()
 
-def parse_vless_header(chunk: bytes):
-    if len(chunk) < 24:
-        raise ValueError("Chunk too small")
-    
-    pos = 1
-    pos += 16
-    
-    addon_len = chunk[pos]
-    pos += 1 + addon_len
-    
-    command = chunk[pos]
-    pos += 1
-    
-    port = int.from_bytes(chunk[pos:pos+2], "big")
-    pos += 2
-    
-    addr_type = chunk[pos]
-    pos += 1
-    
-    if addr_type == 1:
-        address = ".".join(str(b) for b in chunk[pos:pos+4])
-        pos += 4
-    elif addr_type == 2:
-        dlen = chunk[pos]
-        pos += 1
-        address = chunk[pos:pos+dlen].decode("utf-8", errors="ignore")
-        pos += dlen
-    elif addr_type == 3:
-        ab = chunk[pos:pos+16]
-        pos += 16
-        address = ":".join(f"{ab[i]:02x}{ab[i+1]:02x}" for i in range(0, 16, 2))
-    else:
-        raise ValueError(f"Unknown address type: {addr_type}")
-    
-    return command, address, port, chunk[pos:]
-
-@app.websocket("/ws/{uid}")
-async def websocket_endpoint(websocket: WebSocket, uid: str):
-    await handle_vless_websocket(websocket, uid)
-
-# ==================== Telegram Bot ====================
-
-TELEGRAM_BOT_TASK: Optional[asyncio.Task] = None
-TELEGRAM_BOT_INSTANCE: Optional[Any] = None
-NOTIFIED_UIDS: Set[str] = set()
-
-def is_admin_chat(chat_id: int, admin_id: str) -> bool:
-    if not admin_id:
-        return False
-    try:
-        return str(chat_id) == str(admin_id)
-    except:
-        return False
-
-async def restart_telegram_bot():
-    global TELEGRAM_BOT_TASK, TELEGRAM_BOT_INSTANCE
-    
-    await stop_telegram_bot()
-    
-    token = CONFIG.get("telegram_token", "")
-    admin_id = CONFIG.get("telegram_admin_id", "")
-    
-    if not token or not admin_id:
-        logger.info("📢 Telegram bot not configured (token or admin_id missing)")
-        return
-    
-    try:
-        import telebot
-        from telebot.async_telebot import AsyncTeleBot
-        
-        test_bot = AsyncTeleBot(token)
-        try:
-            me = await test_bot.get_me()
-            logger.info(f"✅ Telegram bot token valid: @{me.username}")
-        except Exception as e:
-            logger.error(f"❌ Telegram bot token invalid: {e}")
-            return
-        
-        bot = AsyncTeleBot(token)
-        TELEGRAM_BOT_INSTANCE = bot
-        
-        @bot.message_handler(commands=['start'])
-        async def start_cmd(message):
-            if not is_admin_chat(message.chat.id, admin_id):
-                logger.warning(f"⛔ Unauthorized /start from {message.chat.id}")
-                return
-            
-            await bot.reply_to(
-                message,
-                "🐝 **SLV Panel Bot**\n\n"
-                "سلام! به ربات مدیریت پنل خوش آمدید.\n\n"
-                "📋 **دستورات موجود:**\n"
-                "`/stats` - وضعیت پنل\n"
-                "`/users` - لیست کاربران\n"
-                "`/create نام حجم_GB روز` - ساخت کاربر جدید\n"
-                "`/disable نام` - غیرفعال کردن کاربر\n"
-                "`/enable نام` - فعال کردن کاربر\n"
-                "`/reset نام` - صفر کردن مصرف\n"
-                "`/addaddr آدرس` - افزودن آی‌پی تمیز\n"
-                "`/help` - راهنما\n\n"
-                "📢 **کانال:** @CbeeNet",
-                parse_mode="Markdown"
-            )
-        
-        @bot.message_handler(commands=['stats'])
-        async def stats_cmd(message):
-            if not is_admin_chat(message.chat.id, admin_id):
-                return
-            
-            cpu = psutil.cpu_percent()
-            mem = psutil.virtual_memory()
-            total_traffic = sum(link.get("used", 0) for link in LINKS.values())
-            active_links = sum(1 for link in LINKS.values() if link.get("active", True))
-            
-            await bot.reply_to(
-                message,
-                f"📊 **وضعیت پنل**\n\n"
-                f"💻 **CPU:** {cpu}%\n"
-                f"🧠 **RAM:** {mem.percent}%\n"
-                f"📡 **اینباندها:** {len(LINKS)} (فعال: {active_links})\n"
-                f"📦 **ترافیک کل:** {format_bytes(total_traffic)}\n"
-                f"🔗 **کانال:** @CbeeNet",
-                parse_mode="Markdown"
-            )
-        
-        @bot.message_handler(commands=['users'])
-        async def users_cmd(message):
-            if not is_admin_chat(message.chat.id, admin_id):
-                return
-            
-            if not LINKS:
-                await bot.reply_to(message, "❌ هیچ کاربری وجود ندارد")
-                return
-            
-            text = "👥 **لیست کاربران:**\n\n"
-            for name, data in LINKS.items():
-                status = "🟢" if data.get("active", True) else "🔴"
-                used = data.get("used", 0)
-                limit = data.get("limit", 0)
-                limit_str = format_bytes(limit) if limit > 0 else "♾️"
-                expiry = data.get("expires_at")
-                expiry_str = format_date(expiry) if expiry else "بدون انقضا"
-                text += f"{status} **{name}**\n"
-                text += f"   مصرف: {format_bytes(used)} / {limit_str}\n"
-                text += f"   انقضا: {expiry_str}\n\n"
-            
-            await bot.reply_to(message, text, parse_mode="Markdown")
-        
-        @bot.message_handler(commands=['create'])
-        async def create_cmd(message):
-            if not is_admin_chat(message.chat.id, admin_id):
-                return
-            
-            parts = message.text.split()
-            if len(parts) < 4:
-                await bot.reply_to(
-                    message,
-                    "❌ **فرمت اشتباه**\n"
-                    "استفاده: `/create نام حجم_GB روز`\n"
-                    "مثال: `/create ali 10 30`",
-                    parse_mode="Markdown"
-                )
-                return
-            
-            name = parts[1]
-            try:
-                limit_gb = int(parts[2])
-                days = int(parts[3])
-            except ValueError:
-                await bot.reply_to(message, "❌ حجم و روز باید عدد باشند")
-                return
-            
-            if not re.match(r'^[a-zA-Z0-9_\-]+$', name):
-                await bot.reply_to(message, "❌ نام باید فقط انگلیسی، عدد، زیرخط یا خط تیره باشد")
-                return
-            
-            if name in LINKS:
-                await bot.reply_to(message, f"❌ نام `{name}` قبلاً وجود دارد", parse_mode="Markdown")
-                return
-            
-            uid = str(uuid.uuid4())
-            path = f"/ws/{uid}"
-            
-            expires_at = None
-            if days > 0:
-                expires_at = (datetime.now() + timedelta(days=days)).isoformat()
-            
-            LINKS[name] = {
-                "uid": uid,
-                "name": name,
-                "path": path,
-                "limit": limit_gb * 1024 * 1024 * 1024 if limit_gb > 0 else 0,
-                "used": 0,
-                "expires_at": expires_at,
-                "max_ips": 0,
-                "active": True,
-                "created_at": datetime.now().isoformat(),
-                "remark": name,
-                "protocol": "vless"
-            }
-            
-            save_db()
-            
-            domain = get_domain()
-            vless_link = make_vless_link(uid, domain, path, name)
-            sub_link = f"{get_base_url()}/sub/{uid}"
-            
-            await bot.reply_to(
-                message,
-                f"✅ **کاربر `{name}` ساخته شد!**\n\n"
-                f"🔗 **لینک VLESS:**\n`{vless_link}`\n\n"
-                f"📋 **لینک اشتراک:**\n`{sub_link}`\n\n"
-                f"📊 **محدودیت:** {limit_gb} GB\n"
-                f"📅 **انقضا:** {days} روز",
-                parse_mode="Markdown"
-            )
-        
-        @bot.message_handler(commands=['disable', 'enable', 'reset'])
-        async def toggle_reset_cmd(message):
-            if not is_admin_chat(message.chat.id, admin_id):
-                return
-            
-            parts = message.text.split()
-            if len(parts) != 2:
-                cmd = parts[0].replace('/', '')
-                await bot.reply_to(
-                    message,
-                    f"❌ استفاده: `/{cmd} نام`\nمثال: `/{cmd} ali`",
-                    parse_mode="Markdown"
-                )
-                return
-            
-            name = parts[1]
-            if name not in LINKS:
-                await bot.reply_to(message, f"❌ کاربر `{name}` یافت نشد", parse_mode="Markdown")
-                return
-            
-            cmd = message.text.split()[0].replace('/', '')
-            
-            if cmd == 'disable':
-                LINKS[name]["active"] = False
-                await bot.reply_to(message, f"⏹️ کاربر `{name}` غیرفعال شد", parse_mode="Markdown")
-            elif cmd == 'enable':
-                LINKS[name]["active"] = True
-                await bot.reply_to(message, f"▶️ کاربر `{name}` فعال شد", parse_mode="Markdown")
-            elif cmd == 'reset':
-                LINKS[name]["used"] = 0
-                await bot.reply_to(message, f"🔄 مصرف کاربر `{name}` صفر شد", parse_mode="Markdown")
-            
-            save_db()
-        
-        @bot.message_handler(commands=['addaddr'])
-        async def addaddr_cmd(message):
-            if not is_admin_chat(message.chat.id, admin_id):
-                return
-            
-            parts = message.text.split()
-            if len(parts) != 2:
-                await bot.reply_to(
-                    message,
-                    "❌ استفاده: `/addaddr آدرس`\nمثال: `/addaddr 104.21.0.1`",
-                    parse_mode="Markdown"
-                )
-                return
-            
-            address = parts[1]
-            if not address or len(address) < 3:
-                await bot.reply_to(message, "❌ آدرس نامعتبر")
-                return
-            
-            if address in CUSTOM_ADDRESSES:
-                await bot.reply_to(message, f"❌ آدرس `{address}` قبلاً وجود دارد", parse_mode="Markdown")
-                return
-            
-            CUSTOM_ADDRESSES.append(address)
-            save_db()
-            await bot.reply_to(message, f"✅ آدرس `{address}` افزوده شد", parse_mode="Markdown")
-        
-        @bot.message_handler(commands=['help'])
-        async def help_cmd(message):
-            if not is_admin_chat(message.chat.id, admin_id):
-                return
-            
-            await bot.reply_to(
-                message,
-                "📖 **راهنمای ربات**\n\n"
-                "`/stats` - وضعیت پنل\n"
-                "`/users` - لیست کاربران\n"
-                "`/create نام حجم_GB روز` - ساخت کاربر\n"
-                "`/disable نام` - غیرفعال کردن\n"
-                "`/enable نام` - فعال کردن\n"
-                "`/reset نام` - صفر کردن مصرف\n"
-                "`/addaddr آدرس` - افزودن آی‌پی تمیز\n"
-                "`/help` - این پیام\n\n"
-                "📢 **کانال:** @CbeeNet",
-                parse_mode="Markdown"
-            )
-        
-        async def telegram_notifier():
-            while True:
-                try:
-                    await asyncio.sleep(60)
-                    
-                    if not CONFIG.get("telegram_token") or not CONFIG.get("telegram_admin_id"):
-                        continue
-                    
-                    if not TELEGRAM_BOT_INSTANCE:
-                        continue
-                    
-                    for name, data in LINKS.items():
-                        if not data.get("active", True):
-                            continue
-                        
-                        uid = data.get("uid", "")
-                        
-                        limit = data.get("limit", 0)
-                        used = data.get("used", 0)
-                        if limit > 0 and used >= limit:
-                            key = f"quota_{uid}"
-                            if key not in NOTIFIED_UIDS:
-                                NOTIFIED_UIDS.add(key)
-                                try:
-                                    await TELEGRAM_BOT_INSTANCE.send_message(
-                                        admin_id,
-                                        f"⚠️ **هشدار اتمام حجم!**\n\n"
-                                        f"کاربر: `{name}`\n"
-                                        f"مصرف: {format_bytes(used)} / {format_bytes(limit)}",
-                                        parse_mode="Markdown"
-                                    )
-                                except Exception as e:
-                                    logger.error(f"Failed to send quota alert: {e}")
-                        
-                        expires_at = data.get("expires_at")
-                        if expires_at:
-                            try:
-                                expiry = datetime.fromisoformat(expires_at)
-                                if expiry < datetime.now():
-                                    key = f"expiry_{uid}"
-                                    if key not in NOTIFIED_UIDS:
-                                        NOTIFIED_UIDS.add(key)
-                                        try:
-                                            await TELEGRAM_BOT_INSTANCE.send_message(
-                                                admin_id,
-                                                f"⏰ **هشدار انقضا!**\n\n"
-                                                f"کاربر: `{name}`\n"
-                                                f"تاریخ انقضا: {format_date(expires_at)}",
-                                                parse_mode="Markdown"
-                                            )
-                                        except Exception as e:
-                                            logger.error(f"Failed to send expiry alert: {e}")
-                            except:
-                                pass
-                            
-                except Exception as e:
-                    logger.error(f"Telegram notifier error: {e}")
-        
-        TELEGRAM_BOT_TASK = asyncio.create_task(bot.infinity_polling())
-        asyncio.create_task(telegram_notifier())
-        
-        logger.info("📢 Telegram bot started successfully")
-        
-    except ImportError:
-        logger.warning("⚠️ pyTelegramBotAPI not installed. Telegram bot disabled.")
-    except Exception as e:
-        logger.error(f"❌ Failed to start Telegram bot: {e}")
-
-async def stop_telegram_bot():
-    global TELEGRAM_BOT_TASK, TELEGRAM_BOT_INSTANCE
-    
-    if TELEGRAM_BOT_TASK:
-        TELEGRAM_BOT_TASK.cancel()
-        try:
-            await TELEGRAM_BOT_TASK
-        except:
-            pass
-        TELEGRAM_BOT_TASK = None
-    
-    TELEGRAM_BOT_INSTANCE = None
-    logger.info("📢 Telegram bot stopped")
-
-# ==================== قالب‌های HTML ====================
-
-LOGIN_HTML = """
+# ============ صفحه HTML اصلی (تم زنبوری) ============
+HTML_TEMPLATE = """
 <!DOCTYPE html>
-<html lang="fa" data-theme="dark">
+<html lang="fa" dir="rtl">
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>ورود · SLV Panel</title>
+    <title>🐝 CBee Panel</title>
+    <script src="https://cdn.tailwindcss.com"></script>
+    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.5.1/css/all.min.css">
     <style>
-        * { margin: 0; padding: 0; box-sizing: border-box; }
-        :root {
-            --bg-primary: #0a0a0f;
-            --bg-secondary: #12121a;
-            --bg-card: #1a1a2e;
-            --bg-card-hover: #252540;
-            --text-primary: #e8e8f0;
-            --text-secondary: #a0a0b8;
-            --text-muted: #6a6a8a;
-            --border-color: #2a2a4a;
-            --honey: #f5a623;
-            --honey-dark: #d48f1a;
-            --honey-glow: rgba(245, 166, 35, 0.15);
-            --shadow: 0 8px 32px rgba(0, 0, 0, 0.6);
-            --radius: 16px;
-            --transition: 0.3s cubic-bezier(0.4, 0, 0.2, 1);
+        @import url('https://fonts.googleapis.com/css2?family=Vazirmatn:wght@400;700;900&display=swap');
+        
+        * {
+            margin: 0;
+            padding: 0;
+            box-sizing: border-box;
         }
+        
         body {
-            font-family: 'Segoe UI', Tahoma, sans-serif;
-            background: var(--bg-primary);
-            color: var(--text-primary);
+            font-family: 'Vazirmatn', sans-serif;
+            background: #0a0a0a;
+            color: #e5e5e5;
+            min-height: 100vh;
+            overflow-x: hidden;
+        }
+        
+        :root {
+            --bee-gold: #f59e0b;
+            --bee-gold-light: #fbbf24;
+            --bee-gold-dark: #b45309;
+            --bee-dark: #0a0a0a;
+            --bee-card: rgba(255, 255, 255, 0.05);
+            --bee-border: rgba(245, 158, 11, 0.3);
+            --bee-shadow: 0 8px 32px rgba(245, 158, 11, 0.1);
+        }
+        
+        /* پس‌زمینه شش‌ضلعی */
+        .hex-bg {
+            position: fixed;
+            top: 0;
+            left: 0;
+            width: 100%;
+            height: 100%;
+            z-index: 0;
+            pointer-events: none;
+            opacity: 0.05;
+            background-image: 
+                linear-gradient(30deg, var(--bee-gold) 12%, transparent 12.5%, transparent 87%, var(--bee-gold) 87.5%),
+                linear-gradient(150deg, var(--bee-gold) 12%, transparent 12.5%, transparent 87%, var(--bee-gold) 87.5%),
+                linear-gradient(30deg, var(--bee-gold) 12%, transparent 12.5%, transparent 87%, var(--bee-gold) 87.5%),
+                linear-gradient(150deg, var(--bee-gold) 12%, transparent 12.5%, transparent 87%, var(--bee-gold) 87.5%);
+            background-size: 80px 140px;
+            background-position: 0 0, 0 0, 40px 70px, 40px 70px;
+        }
+        
+        /* کارت‌های شیشه‌ای */
+        .glass-card {
+            background: rgba(255, 255, 255, 0.05);
+            backdrop-filter: blur(10px);
+            -webkit-backdrop-filter: blur(10px);
+            border: 1px solid rgba(245, 158, 11, 0.15);
+            border-radius: 20px;
+            padding: 24px;
+            transition: all 0.4s cubic-bezier(0.4, 0, 0.2, 1);
+            position: relative;
+            overflow: hidden;
+        }
+        
+        .glass-card::before {
+            content: '';
+            position: absolute;
+            top: -50%;
+            left: -50%;
+            width: 200%;
+            height: 200%;
+            background: radial-gradient(circle at 30% 50%, rgba(245, 158, 11, 0.03), transparent 70%);
+            opacity: 0;
+            transition: opacity 0.6s;
+            pointer-events: none;
+        }
+        
+        .glass-card:hover::before {
+            opacity: 1;
+        }
+        
+        .glass-card:hover {
+            transform: translateY(-4px);
+            border-color: rgba(245, 158, 11, 0.4);
+            box-shadow: 0 12px 40px rgba(245, 158, 11, 0.15);
+        }
+        
+        /* دکمه زنبوری */
+        .btn-bee {
+            background: linear-gradient(135deg, var(--bee-gold), var(--bee-gold-dark));
+            color: #000;
+            font-weight: 700;
+            padding: 10px 24px;
+            border: none;
+            border-radius: 12px;
+            cursor: pointer;
+            transition: all 0.3s ease;
+            box-shadow: 0 4px 20px rgba(245, 158, 11, 0.3);
+            position: relative;
+            overflow: hidden;
+        }
+        
+        .btn-bee::after {
+            content: '';
+            position: absolute;
+            top: -50%;
+            left: -50%;
+            width: 200%;
+            height: 200%;
+            background: radial-gradient(circle, rgba(255,255,255,0.2), transparent 60%);
+            opacity: 0;
+            transition: opacity 0.4s;
+        }
+        
+        .btn-bee:hover::after {
+            opacity: 1;
+        }
+        
+        .btn-bee:hover {
+            transform: scale(1.05) translateY(-2px);
+            box-shadow: 0 8px 30px rgba(245, 158, 11, 0.5);
+        }
+        
+        .btn-bee:active {
+            transform: scale(0.95);
+        }
+        
+        /* آیکن زنبور متحرک */
+        .bee-icon {
+            display: inline-block;
+            animation: buzz 3s infinite ease-in-out;
+        }
+        
+        @keyframes buzz {
+            0%, 100% { transform: translateY(0) rotate(0deg) scale(1); }
+            25% { transform: translateY(-5px) rotate(5deg) scale(1.05); }
+            50% { transform: translateY(0) rotate(-3deg) scale(0.95); }
+            75% { transform: translateY(-3px) rotate(3deg) scale(1.02); }
+        }
+        
+        /* نوار اسکرول */
+        ::-webkit-scrollbar {
+            width: 8px;
+        }
+        ::-webkit-scrollbar-track {
+            background: #1a1a1a;
+        }
+        ::-webkit-scrollbar-thumb {
+            background: var(--bee-gold);
+            border-radius: 10px;
+        }
+        ::-webkit-scrollbar-thumb:hover {
+            background: var(--bee-gold-light);
+        }
+        
+        /* انیمیشن شمارنده */
+        .counter {
+            font-size: 2.5rem;
+            font-weight: 900;
+            background: linear-gradient(135deg, var(--bee-gold-light), var(--bee-gold));
+            -webkit-background-clip: text;
+            -webkit-text-fill-color: transparent;
+            background-clip: text;
+        }
+        
+        /* سایدبار */
+        .sidebar {
+            background: rgba(10, 10, 10, 0.95);
+            backdrop-filter: blur(20px);
+            border-left: 1px solid rgba(245, 158, 11, 0.1);
+            width: 280px;
+            height: 100vh;
+            position: fixed;
+            right: 0;
+            top: 0;
+            z-index: 50;
+            padding: 24px 16px;
+            transform: translateX(0);
+            transition: transform 0.3s cubic-bezier(0.4, 0, 0.2, 1);
+            overflow-y: auto;
+        }
+        
+        .sidebar.closed {
+            transform: translateX(100%);
+        }
+        
+        .sidebar-item {
+            display: flex;
+            align-items: center;
+            gap: 12px;
+            padding: 12px 16px;
+            border-radius: 12px;
+            color: #a0a0a0;
+            transition: all 0.3s;
+            cursor: pointer;
+            text-decoration: none;
+        }
+        
+        .sidebar-item:hover, .sidebar-item.active {
+            background: rgba(245, 158, 11, 0.1);
+            color: var(--bee-gold-light);
+        }
+        
+        .sidebar-item i {
+            width: 24px;
+            text-align: center;
+        }
+        
+        .menu-toggle {
+            position: fixed;
+            top: 16px;
+            right: 16px;
+            z-index: 51;
+            background: rgba(245, 158, 11, 0.2);
+            backdrop-filter: blur(10px);
+            border: 1px solid rgba(245, 158, 11, 0.3);
+            border-radius: 12px;
+            padding: 10px 14px;
+            color: var(--bee-gold);
+            cursor: pointer;
+            transition: all 0.3s;
+            display: none;
+        }
+        
+        .menu-toggle:hover {
+            background: rgba(245, 158, 11, 0.3);
+        }
+        
+        @media (max-width: 768px) {
+            .sidebar {
+                width: 100%;
+                transform: translateX(100%);
+            }
+            .sidebar.open {
+                transform: translateX(0);
+            }
+            .menu-toggle {
+                display: block;
+            }
+        }
+        
+        /* ورودی‌ها */
+        .form-input {
+            width: 100%;
+            padding: 12px 16px;
+            background: rgba(255, 255, 255, 0.05);
+            border: 1px solid rgba(255, 255, 255, 0.1);
+            border-radius: 12px;
+            color: #e5e5e5;
+            transition: all 0.3s;
+            outline: none;
+        }
+        
+        .form-input:focus {
+            border-color: var(--bee-gold);
+            box-shadow: 0 0 0 3px rgba(245, 158, 11, 0.1);
+        }
+        
+        .form-input::placeholder {
+            color: #666;
+        }
+        
+        .form-label {
+            display: block;
+            margin-bottom: 6px;
+            color: #a0a0a0;
+            font-size: 0.9rem;
+        }
+        
+        /* تگ‌ها */
+        .badge {
+            padding: 4px 12px;
+            border-radius: 20px;
+            font-size: 0.75rem;
+            font-weight: 700;
+        }
+        
+        .badge-active {
+            background: rgba(34, 197, 94, 0.2);
+            color: #22c55e;
+        }
+        
+        .badge-inactive {
+            background: rgba(239, 68, 68, 0.2);
+            color: #ef4444;
+        }
+        
+        /* مودال */
+        .modal {
+            position: fixed;
+            top: 0;
+            left: 0;
+            right: 0;
+            bottom: 0;
+            background: rgba(0, 0, 0, 0.8);
+            backdrop-filter: blur(10px);
+            z-index: 100;
+            display: none;
+            align-items: center;
+            justify-content: center;
+            padding: 20px;
+        }
+        
+        .modal.active {
+            display: flex;
+        }
+        
+        .modal-content {
+            background: #1a1a1a;
+            border: 1px solid rgba(245, 158, 11, 0.2);
+            border-radius: 24px;
+            padding: 32px;
+            max-width: 500px;
+            width: 100%;
+            max-height: 90vh;
+            overflow-y: auto;
+            animation: slideUp 0.3s ease;
+        }
+        
+        @keyframes slideUp {
+            from { transform: translateY(20px); opacity: 0; }
+            to { transform: translateY(0); opacity: 1; }
+        }
+        
+        /* جدول */
+        .table-container {
+            overflow-x: auto;
+            border-radius: 16px;
+            border: 1px solid rgba(255, 255, 255, 0.05);
+        }
+        
+        table {
+            width: 100%;
+            border-collapse: collapse;
+        }
+        
+        th {
+            text-align: right;
+            padding: 12px 16px;
+            background: rgba(255, 255, 255, 0.03);
+            color: #a0a0a0;
+            font-weight: 700;
+            font-size: 0.85rem;
+            text-transform: uppercase;
+            letter-spacing: 0.5px;
+            border-bottom: 1px solid rgba(255, 255, 255, 0.05);
+        }
+        
+        td {
+            padding: 12px 16px;
+            border-bottom: 1px solid rgba(255, 255, 255, 0.03);
+        }
+        
+        tr:hover td {
+            background: rgba(245, 158, 11, 0.03);
+        }
+        
+        /* صفحه لاگین */
+        .login-container {
             min-height: 100vh;
             display: flex;
             align-items: center;
             justify-content: center;
-            background-image: radial-gradient(ellipse at 20% 50%, rgba(245, 166, 35, 0.05) 0%, transparent 60%),
-                              radial-gradient(ellipse at 80% 50%, rgba(245, 166, 35, 0.03) 0%, transparent 60%);
-        }
-        body::before {
-            content: '';
-            position: fixed;
-            top: 0; left: 0; right: 0; bottom: 0;
-            background-image: url("data:image/svg+xml,%3Csvg width='60' height='60' viewBox='0 0 60 60' xmlns='http://www.w3.org/2000/svg'%3E%3Cpath d='M30 5 L55 17.5 L55 42.5 L30 55 L5 42.5 L5 17.5 Z' fill='none' stroke='rgba(245,166,35,0.05)' stroke-width='1'/%3E%3C/svg%3E");
-            background-size: 60px 60px;
-            pointer-events: none;
-            z-index: 0;
-        }
-        .login-wrapper { position: relative; z-index: 1; width: 100%; max-width: 420px; padding: 20px; }
-        .login-box {
-            background: var(--bg-secondary);
-            border: 1px solid var(--border-color);
-            border-radius: var(--radius);
-            padding: 40px 32px;
-            box-shadow: var(--shadow);
-            backdrop-filter: blur(20px);
             position: relative;
-            overflow: hidden;
-        }
-        .login-box::before {
-            content: '';
-            position: absolute;
-            top: -50%; left: -50%;
-            width: 200%; height: 200%;
-            background: conic-gradient(from 0deg at 50% 50%, transparent 0%, var(--honey-glow) 25%, transparent 50%, var(--honey-glow) 75%, transparent 100%);
-            animation: rotateGlow 10s linear infinite;
-            opacity: 0.1;
-            pointer-events: none;
-        }
-        @keyframes rotateGlow { 0% { transform: rotate(0deg); } 100% { transform: rotate(360deg); } }
-        .login-header { text-align: center; margin-bottom: 32px; position: relative; }
-        .login-header .hex-icon {
-            display: inline-block;
-            width: 72px; height: 83px;
-            background: linear-gradient(135deg, var(--honey), var(--honey-dark));
-            clip-path: polygon(50% 0%, 100% 25%, 100% 75%, 50% 100%, 0% 75%, 0% 25%);
-            line-height: 83px;
-            font-size: 2.2rem;
-            margin-bottom: 16px;
-            box-shadow: 0 4px 20px rgba(245, 166, 35, 0.3);
-        }
-        .login-header h1 { font-size: 1.8rem; font-weight: 700; background: linear-gradient(135deg, var(--honey), #ffd700); -webkit-background-clip: text; -webkit-text-fill-color: transparent; background-clip: text; }
-        .login-header p { color: var(--text-secondary); font-size: 0.9rem; margin-top: 4px; }
-        .login-form { position: relative; }
-        .form-group { margin-bottom: 20px; }
-        .form-group label { display: block; color: var(--text-secondary); font-size: 0.85rem; font-weight: 500; margin-bottom: 6px; }
-        .form-group input {
-            width: 100%;
-            padding: 12px 16px;
-            background: var(--bg-primary);
-            border: 1px solid var(--border-color);
-            border-radius: 10px;
-            color: var(--text-primary);
-            font-size: 1rem;
-            transition: var(--transition);
-            outline: none;
-        }
-        .form-group input:focus { border-color: var(--honey); box-shadow: 0 0 0 3px var(--honey-glow); }
-        .form-group input::placeholder { color: var(--text-muted); }
-        .btn-login {
-            width: 100%;
-            padding: 14px;
-            background: linear-gradient(135deg, var(--honey), var(--honey-dark));
-            border: none;
-            border-radius: 10px;
-            color: #fff;
-            font-size: 1rem;
-            font-weight: 600;
-            cursor: pointer;
-            transition: var(--transition);
-            position: relative;
-            overflow: hidden;
-        }
-        .btn-login:hover { transform: translateY(-2px); box-shadow: 0 8px 30px rgba(245, 166, 35, 0.3); }
-        .btn-login:active { transform: translateY(0); }
-        #loginError {
-            color: #ff6b6b;
-            font-size: 0.85rem;
-            text-align: center;
-            margin-top: 12px;
-            display: none;
-            padding: 8px 12px;
-            background: rgba(255, 107, 107, 0.1);
-            border-radius: 8px;
-            border: 1px solid rgba(255, 107, 107, 0.2);
-        }
-        .login-footer { text-align: center; margin-top: 24px; color: var(--text-muted); font-size: 0.8rem; }
-        .login-footer .heart { display: inline-block; animation: pulse 1.5s infinite; color: #ff6b6b; }
-        @keyframes pulse { 0%, 100% { transform: scale(1); } 50% { transform: scale(1.3); } }
-        .login-footer a { color: var(--honey); text-decoration: none; }
-        .login-footer a:hover { text-decoration: underline; }
-        @media (max-width: 480px) {
-            .login-box { padding: 28px 20px; }
-            .login-header h1 { font-size: 1.4rem; }
-            .login-header .hex-icon { width: 56px; height: 65px; line-height: 65px; font-size: 1.8rem; }
-        }
-    </style>
-</head>
-<body>
-    <div class="login-wrapper">
-        <div class="login-box">
-            <div class="login-header">
-                <div class="hex-icon">🐝</div>
-                <h1>SLV Panel</h1>
-                <p>ورود به پنل مدیریت</p>
-            </div>
-            <form class="login-form" id="loginForm" onsubmit="login(event)">
-                <div class="form-group">
-                    <label for="username">نام کاربری</label>
-                    <input type="text" id="username" placeholder="admin" value="admin" required>
-                </div>
-                <div class="form-group">
-                    <label for="password">رمز عبور</label>
-                    <input type="password" id="password" placeholder="رمز عبور خود را وارد کنید" required>
-                </div>
-                <button type="submit" class="btn-login">🚀 ورود به پنل</button>
-                <div id="loginError"></div>
-            </form>
-            <div class="login-footer">
-                ساخته شده با <span class="heart">💛</span> توسط <strong style="color: var(--honey);">CBeeNet</strong>
-                <br><span style="font-size: 0.75rem;">📢 <a href="https://t.me/CbeeNet" target="_blank">@CbeeNet</a></span>
-            </div>
-        </div>
-    </div>
-    <script>
-    async function login(e) {
-        e.preventDefault();
-        const username = document.getElementById('username').value;
-        const password = document.getElementById('password').value;
-        const errorDiv = document.getElementById('loginError');
-        errorDiv.style.display = 'none';
-        errorDiv.textContent = '';
-        try {
-            const formData = new URLSearchParams();
-            formData.append('username', username);
-            formData.append('password', password);
-            const res = await fetch('/api/login', {
-                method: 'POST',
-                headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
-                body: formData.toString()
-            });
-            const data = await res.json();
-            if (res.ok && data.status === 'ok') {
-                window.location.href = '/dashboard';
-            } else {
-                errorDiv.textContent = data.detail || 'نام کاربری یا رمز عبور اشتباه است';
-                errorDiv.style.display = 'block';
-            }
-        } catch(err) {
-            errorDiv.textContent = 'خطا در ارتباط با سرور';
-            errorDiv.style.display = 'block';
-            console.error('Login error:', err);
-        }
-    }
-    </script>
-</body>
-</html>
-"""
-
-DASHBOARD_HTML = """
-<!DOCTYPE html>
-<html lang="fa" data-theme="dark">
-<head>
-    <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>داشبورد · SLV Panel</title>
-    <style>
-        * { margin: 0; padding: 0; box-sizing: border-box; }
-        :root {
-            --bg-primary: #0a0a0f;
-            --bg-secondary: #12121a;
-            --bg-card: #1a1a2e;
-            --bg-card-hover: #252540;
-            --text-primary: #e8e8f0;
-            --text-secondary: #a0a0b8;
-            --text-muted: #6a6a8a;
-            --border-color: #2a2a4a;
-            --honey: #f5a623;
-            --honey-dark: #d48f1a;
-            --honey-glow: rgba(245, 166, 35, 0.15);
-            --shadow: 0 8px 32px rgba(0, 0, 0, 0.6);
-            --radius: 16px;
-            --transition: 0.3s cubic-bezier(0.4, 0, 0.2, 1);
-            --success: #2ecc71;
-            --danger: #e74c3c;
-            --warning: #f39c12;
-        }
-        body { font-family: 'Segoe UI', Tahoma, sans-serif; background: var(--bg-primary); color: var(--text-primary); min-height: 100vh; }
-        body::before {
-            content: '';
-            position: fixed;
-            top: 0; left: 0; right: 0; bottom: 0;
-            background-image: url("data:image/svg+xml,%3Csvg width='60' height='60' viewBox='0 0 60 60' xmlns='http://www.w3.org/2000/svg'%3E%3Cpath d='M30 5 L55 17.5 L55 42.5 L30 55 L5 42.5 L5 17.5 Z' fill='none' stroke='rgba(245,166,35,0.04)' stroke-width='1'/%3E%3C/svg%3E");
-            background-size: 60px 60px;
-            pointer-events: none;
-            z-index: 0;
-        }
-        .header {
-            position: sticky;
-            top: 0; z-index: 100;
-            background: rgba(10, 10, 15, 0.85);
-            backdrop-filter: blur(20px);
-            border-bottom: 1px solid var(--border-color);
-            padding: 16px 32px;
-            display: flex;
-            align-items: center;
-            justify-content: space-between;
-        }
-        .header-left { display: flex; align-items: center; gap: 16px; }
-        .header .hex-icon {
-            display: inline-block;
-            width: 40px; height: 46px;
-            background: linear-gradient(135deg, var(--honey), var(--honey-dark));
-            clip-path: polygon(50% 0%, 100% 25%, 100% 75%, 50% 100%, 0% 75%, 0% 25%);
-            line-height: 46px;
-            text-align: center;
-            font-size: 1.2rem;
-        }
-        .header h1 { font-size: 1.4rem; font-weight: 700; background: linear-gradient(135deg, var(--honey), #ffd700); -webkit-background-clip: text; -webkit-text-fill-color: transparent; background-clip: text; }
-        .header-right { display: flex; align-items: center; gap: 16px; }
-        .btn-logout {
-            padding: 8px 20px;
-            background: transparent;
-            border: 1px solid var(--border-color);
-            border-radius: 8px;
-            color: var(--text-secondary);
-            cursor: pointer;
-            transition: var(--transition);
-        }
-        .btn-logout:hover { background: var(--bg-card); color: var(--text-primary); }
-        .container { max-width: 1400px; margin: 0 auto; padding: 24px 32px 60px; position: relative; z-index: 1; }
-        .stats-grid {
-            display: grid;
-            grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
-            gap: 20px;
-            margin-bottom: 32px;
-        }
-        .stat-card {
-            background: var(--bg-secondary);
-            border: 1px solid var(--border-color);
-            border-radius: var(--radius);
-            padding: 20px 24px;
-            transition: var(--transition);
-        }
-        .stat-card:hover { border-color: var(--honey); box-shadow: 0 4px 20px var(--honey-glow); }
-        .stat-card .label { color: var(--text-muted); font-size: 0.8rem; text-transform: uppercase; letter-spacing: 0.5px; }
-        .stat-card .value { font-size: 2rem; font-weight: 700; margin-top: 4px; background: linear-gradient(135deg, var(--text-primary), var(--text-secondary)); -webkit-background-clip: text; -webkit-text-fill-color: transparent; background-clip: text; }
-        .tabs { display: flex; gap: 8px; margin-bottom: 24px; flex-wrap: wrap; }
-        .tab-btn {
-            padding: 10px 24px;
-            background: var(--bg-secondary);
-            border: 1px solid var(--border-color);
-            border-radius: 10px;
-            color: var(--text-secondary);
-            cursor: pointer;
-            transition: var(--transition);
-            font-size: 0.9rem;
-        }
-        .tab-btn:hover { border-color: var(--honey); color: var(--text-primary); }
-        .tab-btn.active { background: linear-gradient(135deg, var(--honey), var(--honey-dark)); border-color: var(--honey); color: #fff; }
-        .hex-grid {
-            display: flex;
-            flex-wrap: wrap;
-            gap: 20px;
-            margin-bottom: 32px;
-            justify-content: center;
-        }
-        .hex-card {
-            width: 140px; height: 160px;
-            background: linear-gradient(145deg, var(--bg-secondary), var(--bg-card));
-            clip-path: polygon(50% 0%, 100% 25%, 100% 75%, 50% 100%, 0% 75%, 0% 25%);
-            display: flex;
-            flex-direction: column;
-            align-items: center;
-            justify-content: center;
-            color: var(--text-primary);
-            font-weight: 600;
-            font-size: 0.9rem;
-            cursor: pointer;
-            transition: var(--transition);
-            border: 1px solid var(--border-color);
+            z-index: 1;
             padding: 20px;
-            text-align: center;
         }
-        .hex-card:hover { transform: scale(1.05) translateY(-4px); border-color: var(--honey); box-shadow: 0 8px 30px var(--honey-glow); }
-        .hex-card .protocol-icon { font-size: 1.8rem; margin-bottom: 8px; }
-        .hex-card .badge { font-size: 0.65rem; color: var(--text-muted); margin-top: 4px; }
-        .table-wrapper {
-            background: var(--bg-secondary);
-            border: 1px solid var(--border-color);
-            border-radius: var(--radius);
-            overflow: hidden;
-            margin-top: 16px;
-        }
-        .table-wrapper table { width: 100%; border-collapse: collapse; }
-        .table-wrapper th {
-            background: var(--bg-primary);
-            color: var(--text-secondary);
-            font-weight: 600;
-            font-size: 0.8rem;
-            text-transform: uppercase;
-            letter-spacing: 0.5px;
-            padding: 14px 16px;
-            text-align: left;
-            border-bottom: 1px solid var(--border-color);
-        }
-        .table-wrapper td { padding: 14px 16px; border-bottom: 1px solid var(--border-color); color: var(--text-primary); font-size: 0.9rem; }
-        .table-wrapper tr:hover td { background: var(--bg-card); }
-        .status-badge {
-            display: inline-block;
-            padding: 3px 12px;
-            border-radius: 20px;
-            font-size: 0.75rem;
-            font-weight: 600;
-        }
-        .status-badge.active { background: rgba(46, 204, 113, 0.2); color: var(--success); }
-        .status-badge.inactive { background: rgba(231, 76, 60, 0.2); color: var(--danger); }
-        .btn-sm {
-            padding: 4px 12px;
-            border: none;
-            border-radius: 6px;
-            cursor: pointer;
-            font-size: 0.75rem;
-            transition: var(--transition);
-            margin-right: 4px;
-        }
-        .btn-sm.primary { background: var(--honey); color: #fff; }
-        .btn-sm.primary:hover { background: var(--honey-dark); }
-        .btn-sm.danger { background: var(--danger); color: #fff; }
-        .btn-sm.danger:hover { background: #c0392b; }
-        .btn-sm.success { background: var(--success); color: #fff; }
-        .btn-sm.success:hover { background: #27ae60; }
-        .modal-overlay {
-            display: none;
-            position: fixed;
-            top: 0; left: 0; right: 0; bottom: 0;
-            background: rgba(0, 0, 0, 0.7);
-            backdrop-filter: blur(10px);
-            z-index: 1000;
-            align-items: center;
-            justify-content: center;
-        }
-        .modal-overlay.show { display: flex; }
-        .modal {
-            background: var(--bg-secondary);
-            border: 1px solid var(--border-color);
-            border-radius: var(--radius);
-            padding: 32px;
-            max-width: 500px;
-            width: 90%;
-            max-height: 80vh;
-            overflow-y: auto;
-        }
-        .modal h2 { margin-bottom: 20px; color: var(--text-primary); }
-        .modal .form-group { margin-bottom: 16px; }
-        .modal .form-group label { display: block; color: var(--text-secondary); font-size: 0.85rem; margin-bottom: 4px; }
-        .modal .form-group input, .modal .form-group select {
+        
+        .login-box {
+            background: rgba(255, 255, 255, 0.05);
+            backdrop-filter: blur(20px);
+            border: 1px solid rgba(245, 158, 11, 0.2);
+            border-radius: 32px;
+            padding: 48px;
             width: 100%;
-            padding: 10px 14px;
-            background: var(--bg-primary);
-            border: 1px solid var(--border-color);
-            border-radius: 8px;
-            color: var(--text-primary);
-            font-size: 0.95rem;
-        }
-        .modal .form-group input:focus { border-color: var(--honey); outline: none; }
-        .modal .modal-actions { display: flex; gap: 12px; margin-top: 20px; justify-content: flex-end; }
-        .modal .modal-actions button { padding: 10px 24px; border: none; border-radius: 8px; cursor: pointer; font-size: 0.9rem; transition: var(--transition); }
-        .modal .modal-actions .btn-cancel { background: var(--bg-primary); color: var(--text-secondary); }
-        .modal .modal-actions .btn-cancel:hover { background: var(--bg-card); }
-        .modal .modal-actions .btn-submit { background: linear-gradient(135deg, var(--honey), var(--honey-dark)); color: #fff; }
-        .modal .modal-actions .btn-submit:hover { box-shadow: 0 4px 20px var(--honey-glow); }
-        .footer {
+            max-width: 420px;
             text-align: center;
-            padding: 24px 0;
-            color: var(--text-muted);
-            font-size: 0.85rem;
-            border-top: 1px solid var(--border-color);
-            margin-top: 40px;
         }
-        .footer .heart { display: inline-block; animation: pulse 1.5s infinite; color: #ff6b6b; }
-        @keyframes pulse { 0%, 100% { transform: scale(1); } 50% { transform: scale(1.3); } }
-        .footer a { color: var(--honey); text-decoration: none; }
-        .footer a:hover { text-decoration: underline; }
-        @media (max-width: 768px) {
-            .header { padding: 12px 16px; flex-wrap: wrap; gap: 8px; }
-            .header h1 { font-size: 1.1rem; }
-            .container { padding: 16px; }
-            .stats-grid { grid-template-columns: 1fr 1fr; }
-            .hex-card { width: 110px; height: 130px; font-size: 0.75rem; }
-            .table-wrapper { overflow-x: auto; }
+        
+        .login-title {
+            font-size: 2rem;
+            font-weight: 900;
+            background: linear-gradient(135deg, var(--bee-gold-light), var(--bee-gold));
+            -webkit-background-clip: text;
+            -webkit-text-fill-color: transparent;
+            background-clip: text;
+            margin-bottom: 8px;
         }
-        @media (max-width: 480px) {
-            .stats-grid { grid-template-columns: 1fr; }
-            .header-right .btn-logout { padding: 6px 12px; font-size: 0.8rem; }
+        
+        .login-subtitle {
+            color: #a0a0a0;
+            margin-bottom: 32px;
         }
+        
+        .toast {
+            position: fixed;
+            bottom: 24px;
+            right: 24px;
+            z-index: 200;
+            background: #1a1a1a;
+            border: 1px solid rgba(245, 158, 11, 0.3);
+            border-radius: 16px;
+            padding: 16px 24px;
+            color: #e5e5e5;
+            box-shadow: 0 8px 32px rgba(0,0,0,0.5);
+            transform: translateY(100px);
+            opacity: 0;
+            transition: all 0.4s cubic-bezier(0.4, 0, 0.2, 1);
+            display: flex;
+            align-items: center;
+            gap: 12px;
+        }
+        
+        .toast.show {
+            transform: translateY(0);
+            opacity: 1;
+        }
+        
+        .toast.success { border-color: #22c55e; }
+        .toast.error { border-color: #ef4444; }
     </style>
 </head>
 <body>
-    <header class="header">
-        <div class="header-left">
-            <div class="hex-icon">🐝</div>
-            <h1>SLV Panel</h1>
-        </div>
-        <div class="header-right">
-            <button class="btn-logout" onclick="logout()">🚪 خروج</button>
-        </div>
-    </header>
-    <div class="container">
-        <div class="stats-grid" id="statsGrid">
-            <div class="stat-card"><div class="label">اتصالات فعال</div><div class="value" id="activeConns">0</div></div>
-            <div class="stat-card"><div class="label">ترافیک کل</div><div class="value" id="totalTraffic">0 MB</div></div>
-            <div class="stat-card"><div class="label">اینباندها</div><div class="value" id="totalLinks">0</div></div>
-            <div class="stat-card"><div class="label">فعال</div><div class="value" id="activeLinks">0</div></div>
-        </div>
-        <div class="tabs">
-            <button class="tab-btn active" data-tab="links" onclick="switchTab('links')">🔗 اینباندها</button>
-            <button class="tab-btn" data-tab="addresses" onclick="switchTab('addresses')">🌐 آی‌پی تمیز</button>
-            <button class="tab-btn" data-tab="settings" onclick="switchTab('settings')">⚙️ تنظیمات</button>
-        </div>
-        <div id="tab-links" class="tab-content">
-            <div style="display:flex; justify-content:space-between; align-items:center; flex-wrap:wrap; gap:12px; margin-bottom:16px;">
-                <h3 style="color:var(--text-primary);">مدیریت اینباندها</h3>
-                <button class="btn-sm primary" style="padding:10px 20px; font-size:0.9rem;" onclick="showCreateModal()">➕ ساخت اینباند جدید</button>
-            </div>
-            <div class="hex-grid" id="protocolGrid">
-                <div class="hex-card" onclick="filterLinks('all')"><div class="protocol-icon">📦</div><div>همه</div><div class="badge" id="allCount">0</div></div>
-                <div class="hex-card" onclick="filterLinks('vless')"><div class="protocol-icon">🚀</div><div>VLESS</div><div class="badge" id="vlessCount">0</div></div>
-                <div class="hex-card" onclick="filterLinks('vmess')"><div class="protocol-icon">🔐</div><div>VMess</div><div class="badge" id="vmessCount">0</div></div>
-                <div class="hex-card" onclick="filterLinks('trojan')"><div class="protocol-icon">🛡️</div><div>Trojan</div><div class="badge" id="trojanCount">0</div></div>
-            </div>
-            <div class="table-wrapper" id="linksTable">
-                <table><thead><tr><th>نام</th><th>پروتکل</th><th>مصرف</th><th>سقف</th><th>انقضا</th><th>وضعیت</th><th>عملیات</th></tr></thead><tbody id="linksBody"><tr><td colspan="7" style="text-align:center; color:var(--text-muted);">در حال بارگذاری...</td></tr></tbody></table>
-            </div>
-        </div>
-        <div id="tab-addresses" class="tab-content" style="display:none;">
-            <div style="display:flex; justify-content:space-between; align-items:center; flex-wrap:wrap; gap:12px; margin-bottom:16px;">
-                <h3 style="color:var(--text-primary);">مدیریت آی‌پی‌های تمیز</h3>
-                <div style="display:flex; gap:8px; flex-wrap:wrap;">
-                    <button class="btn-sm primary" onclick="showAddAddressModal()">➕ افزودن</button>
-                    <button class="btn-sm danger" onclick="deleteAllAddresses()">🗑️ حذف همه</button>
-                </div>
-            </div>
-            <div class="table-wrapper"><table><thead><tr><th>#</th><th>آدرس</th><th>عملیات</th></tr></thead><tbody id="addressesBody"><tr><td colspan="3" style="text-align:center; color:var(--text-muted);">در حال بارگذاری...</td></tr></tbody></table></div>
-        </div>
-        <div id="tab-settings" class="tab-content" style="display:none;">
-            <h3 style="color:var(--text-primary); margin-bottom:16px;">تنظیمات پنل</h3>
-            <div class="table-wrapper" style="padding:24px;">
-                <form id="settingsForm" onsubmit="saveSettings(event)">
-                    <div class="form-group"><label for="tgToken">توکن ربات تلگرام</label><input type="text" id="tgToken" placeholder="توکن ربات خود را وارد کنید" style="width:100%; padding:10px 14px; background:var(--bg-primary); border:1px solid var(--border-color); border-radius:8px; color:var(--text-primary);"></div>
-                    <div class="form-group"><label for="tgAdminId">آیدی ادمین تلگرام</label><input type="text" id="tgAdminId" placeholder="آیدی عددی ادمین را وارد کنید" style="width:100%; padding:10px 14px; background:var(--bg-primary); border:1px solid var(--border-color); border-radius:8px; color:var(--text-primary);"></div>
-                    <button type="submit" class="btn-sm primary" style="padding:10px 24px; font-size:0.9rem;">💾 ذخیره تنظیمات</button>
-                    <span id="settingsStatus" style="margin-left:12px; color:var(--success);"></span>
-                </form>
-                <hr style="border-color:var(--border-color); margin:24px 0;">
-                <h4 style="color:var(--text-secondary); margin-bottom:12px;">تغییر رمز عبور</h4>
-                <form id="passwordForm" onsubmit="changePassword(event)">
-                    <div class="form-group"><label for="currentPassword">رمز فعلی</label><input type="password" id="currentPassword" placeholder="رمز فعلی" style="width:100%; padding:10px 14px; background:var(--bg-primary); border:1px solid var(--border-color); border-radius:8px; color:var(--text-primary);"></div>
-                    <div class="form-group"><label for="newPassword">رمز جدید</label><input type="password" id="newPassword" placeholder="رمز جدید" style="width:100%; padding:10px 14px; background:var(--bg-primary); border:1px solid var(--border-color); border-radius:8px; color:var(--text-primary);"></div>
-                    <button type="submit" class="btn-sm primary" style="padding:10px 24px; font-size:0.9rem;">🔑 تغییر رمز</button>
-                    <span id="passwordStatus" style="margin-left:12px; color:var(--success);"></span>
-                </form>
-            </div>
-        </div>
-        <div class="footer">
-            ساخته شده با <span class="heart">💛</span> توسط <strong style="color: var(--honey);">CBeeNet</strong>
-            <br><span style="font-size: 0.75rem;">📢 <a href="https://t.me/CbeeNet" target="_blank">@CbeeNet</a></span>
-        </div>
+    <div class="hex-bg"></div>
+    
+    <!-- Toast Notification -->
+    <div id="toast" class="toast">
+        <i id="toastIcon" class="fas fa-check-circle text-green-500"></i>
+        <span id="toastMessage">پیام</span>
     </div>
-    <div class="modal-overlay" id="createModal">
-        <div class="modal">
-            <h2>➕ ساخت اینباند جدید</h2>
-            <form id="createForm" onsubmit="createLink(event)">
-                <div class="form-group"><label for="linkName">نام (فقط انگلیسی)</label><input type="text" id="linkName" placeholder="مثال: my-user" required></div>
-                <div class="form-group"><label for="linkLimit">محدودیت حجم (GB) - 0 = نامحدود</label><input type="number" id="linkLimit" value="10" min="0"></div>
-                <div class="form-group"><label for="linkDays">مدت اعتبار (روز) - 0 = بدون انقضا</label><input type="number" id="linkDays" value="30" min="0"></div>
-                <div class="form-group"><label for="linkMaxIps">حداکثر IP همزمان - 0 = نامحدود</label><input type="number" id="linkMaxIps" value="0" min="0"></div>
-                <div class="form-group"><label for="linkProtocol">پروتکل</label>
-                    <select id="linkProtocol">
-                        <option value="vless">VLESS</option>
-                        <option value="vmess">VMess</option>
-                        <option value="trojan">Trojan</option>
-                    </select>
-                </div>
-                <div class="modal-actions">
-                    <button type="button" class="btn-cancel" onclick="closeModal('createModal')">انصراف</button>
-                    <button type="submit" class="btn-submit">🚀 ساخت</button>
-                </div>
-            </form>
-            <div id="createResult" style="margin-top:12px;"></div>
+    
+    <!-- Menu Toggle (Mobile) -->
+    <button class="menu-toggle" id="menuToggle">
+        <i class="fas fa-bars fa-lg"></i>
+    </button>
+    
+    <!-- Sidebar -->
+    <nav class="sidebar" id="sidebar">
+        <div class="text-center mb-8">
+            <div class="bee-icon text-5xl mb-2">🐝</div>
+            <h1 class="text-2xl font-black text-transparent bg-clip-text bg-gradient-to-r from-amber-400 to-amber-600">CBee Panel</h1>
+            <p class="text-xs text-gray-500 mt-1">v2.0.0 • Professional</p>
         </div>
-    </div>
-    <div class="modal-overlay" id="addressModal">
-        <div class="modal">
-            <h2>➕ افزودن آی‌پی تمیز</h2>
-            <form id="addressForm" onsubmit="addAddress(event)">
-                <div class="form-group"><label for="addressInput">آدرس (IP یا دامنه)</label><input type="text" id="addressInput" placeholder="مثال: 104.21.0.1 یا cf.example.com" required></div>
-                <div class="modal-actions">
-                    <button type="button" class="btn-cancel" onclick="closeModal('addressModal')">انصراف</button>
-                    <button type="submit" class="btn-submit">➕ افزودن</button>
-                </div>
-            </form>
-            <div id="addressResult" style="margin-top:12px;"></div>
-        </div>
-    </div>
-    <script>
-        let currentFilter = 'all';
-        let linksData = {};
-        let addressesData = [];
         
-        async function apiRequest(url, options = {}) {
-            const res = await fetch(url, { ...options, credentials: 'include' });
-            if (res.status === 401) { window.location.href = '/login'; return null; }
-            return res;
+        <div class="space-y-1">
+            <a href="/" class="sidebar-item active" data-page="dashboard">
+                <i class="fas fa-chart-pie"></i> داشبورد
+            </a>
+            <a href="/inbounds" class="sidebar-item" data-page="inbounds">
+                <i class="fas fa-users"></i> اینباندها
+            </a>
+            <a href="/traffic" class="sidebar-item" data-page="traffic">
+                <i class="fas fa-chart-line"></i> ترافیک
+            </a>
+            <a href="/clean-ip" class="sidebar-item" data-page="clean-ip">
+                <i class="fas fa-network-wired"></i> آی‌پی تمیز
+            </a>
+            <a href="/settings" class="sidebar-item" data-page="settings">
+                <i class="fas fa-cog"></i> تنظیمات
+            </a>
+            <a href="/security" class="sidebar-item" data-page="security">
+                <i class="fas fa-shield-alt"></i> امنیت
+            </a>
+        </div>
+        
+        <div class="mt-auto pt-4 border-t border-gray-800">
+            <a href="/api/logout" class="sidebar-item text-red-400 hover:bg-red-500/10">
+                <i class="fas fa-sign-out-alt"></i> خروج
+            </a>
+        </div>
+    </nav>
+    
+    <!-- Main Content -->
+    <div class="main-content" style="margin-right: 280px; min-height: 100vh; position: relative; z-index: 1; padding: 24px;">
+        <div class="max-w-7xl mx-auto" id="pageContent">
+            <!-- Content will be loaded here -->
+        </div>
+    </div>
+    
+    <script>
+        // ============ تنظیمات اولیه ============
+        const API_BASE = '';
+        let currentPage = 'dashboard';
+        let toastTimeout = null;
+        
+        // ============ توابع کمکی ============
+        function showToast(message, type = 'success') {
+            const toast = document.getElementById('toast');
+            const toastMessage = document.getElementById('toastMessage');
+            const toastIcon = document.getElementById('toastIcon');
+            
+            toast.className = 'toast';
+            if (type === 'success') {
+                toast.classList.add('success');
+                toastIcon.className = 'fas fa-check-circle text-green-500';
+            } else if (type === 'error') {
+                toast.classList.add('error');
+                toastIcon.className = 'fas fa-exclamation-circle text-red-500';
+            } else {
+                toastIcon.className = 'fas fa-info-circle text-blue-500';
+            }
+            
+            toastMessage.textContent = message;
+            toast.classList.add('show');
+            
+            if (toastTimeout) clearTimeout(toastTimeout);
+            toastTimeout = setTimeout(() => {
+                toast.classList.remove('show');
+            }, 4000);
         }
         
         function formatBytes(bytes) {
@@ -1576,370 +665,1499 @@ DASHBOARD_HTML = """
             return parseFloat((bytes / Math.pow(k, i)).toFixed(2)) + ' ' + sizes[i];
         }
         
-        function formatDate(dateStr) {
-            if (!dateStr) return 'بدون انقضا';
-            try { const d = new Date(dateStr); return d.toLocaleDateString('fa-IR'); } catch { return dateStr; }
+        function formatDate(timestamp) {
+            if (!timestamp) return 'نامحدود';
+            const d = new Date(timestamp);
+            return d.toLocaleDateString('fa-IR') + ' ' + d.toLocaleTimeString('fa-IR', {hour: '2-digit', minute:'2-digit'});
         }
         
-        function switchTab(tab) {
-            document.querySelectorAll('.tab-content').forEach(el => el.style.display = 'none');
-            document.querySelectorAll('.tab-btn').forEach(el => el.classList.remove('active'));
-            document.getElementById('tab-' + tab).style.display = 'block';
-            document.querySelector(`.tab-btn[data-tab="${tab}"]`).classList.add('active');
-            if (tab === 'links') loadLinks();
-            else if (tab === 'addresses') loadAddresses();
-            else if (tab === 'settings') loadSettings();
+        function getStatusBadge(active) {
+            return active ? 
+                '<span class="badge badge-active"><i class="fas fa-circle text-xs mr-1"></i> فعال</span>' :
+                '<span class="badge badge-inactive"><i class="fas fa-circle text-xs mr-1"></i> غیرفعال</span>';
         }
         
-        async function loadStats() {
+        // ============ بارگذاری صفحات ============
+        async function loadPage(page, data = null) {
+            currentPage = page;
+            
+            // به‌روزرسانی سایدبار
+            document.querySelectorAll('.sidebar-item').forEach(el => el.classList.remove('active'));
+            document.querySelector(`.sidebar-item[data-page="${page}"]`)?.classList.add('active');
+            
             try {
-                const res = await apiRequest('/stats');
-                if (!res) return;
-                const data = await res.json();
-                document.getElementById('activeConns').textContent = data.active_connections || 0;
-                document.getElementById('totalTraffic').textContent = formatBytes(data.total_traffic || 0);
-                document.getElementById('totalLinks').textContent = data.total_links || 0;
-                document.getElementById('activeLinks').textContent = data.active_links || 0;
-            } catch(e) { console.error('Error loading stats:', e); }
+                const response = await fetch(`/api/page/${page}`, {
+                    headers: { 'X-Requested-With': 'XMLHttpRequest' }
+                });
+                
+                if (!response.ok) {
+                    if (response.status === 401) {
+                        window.location.href = '/login';
+                        return;
+                    }
+                    throw new Error('خطا در بارگذاری صفحه');
+                }
+                
+                const html = await response.text();
+                document.getElementById('pageContent').innerHTML = html;
+                
+                // اجرای اسکریپت‌های مخصوص صفحه
+                if (page === 'dashboard') initDashboard();
+                else if (page === 'inbounds') initInbounds();
+                else if (page === 'clean-ip') initCleanIP();
+                else if (page === 'settings') initSettings();
+                else if (page === 'security') initSecurity();
+                else if (page === 'traffic') initTraffic();
+                
+                // بستن سایدبار در موبایل
+                if (window.innerWidth <= 768) {
+                    document.getElementById('sidebar').classList.remove('open');
+                }
+            } catch (error) {
+                console.error('Error loading page:', error);
+                showToast('خطا در بارگذاری صفحه', 'error');
+            }
         }
         
-        async function loadLinks() {
+        // ============ مدیریت سایدبار ============
+        document.getElementById('menuToggle')?.addEventListener('click', () => {
+            document.getElementById('sidebar').classList.toggle('open');
+        });
+        
+        document.querySelectorAll('.sidebar-item').forEach(el => {
+            el.addEventListener('click', (e) => {
+                e.preventDefault();
+                const page = el.dataset.page;
+                if (page) loadPage(page);
+            });
+        });
+        
+        // ============ صفحه داشبورد ============
+        async function initDashboard() {
             try {
-                const res = await apiRequest('/api/links');
-                if (!res) return;
-                const data = await res.json();
-                linksData = data.links || {};
-                const names = Object.keys(linksData);
-                document.getElementById('allCount').textContent = names.length;
-                document.getElementById('vlessCount').textContent = names.filter(n => linksData[n].protocol === 'vless').length;
-                document.getElementById('vmessCount').textContent = names.filter(n => linksData[n].protocol === 'vmess').length;
-                document.getElementById('trojanCount').textContent = names.filter(n => linksData[n].protocol === 'trojan').length;
-                renderLinks();
-            } catch(e) { console.error('Error loading links:', e); }
+                const response = await fetch('/api/stats');
+                if (!response.ok) throw new Error('خطا در دریافت آمار');
+                const stats = await response.json();
+                
+                // به‌روزرسانی کارت‌ها
+                document.getElementById('statUsers').textContent = stats.total_links || 0;
+                document.getElementById('statActive').textContent = stats.active_links || 0;
+                document.getElementById('statTraffic').textContent = formatBytes(stats.total_traffic || 0);
+                document.getElementById('statCPU').textContent = stats.cpu_percent || 0;
+                document.getElementById('statMemory').textContent = stats.memory_percent || 0;
+                document.getElementById('statUptime').textContent = stats.uptime || '0s';
+                
+                // آپدیت نمودار (اگر وجود داشته باشد)
+                if (typeof Chart !== 'undefined' && stats.hourly_data) {
+                    const ctx = document.getElementById('trafficChart')?.getContext('2d');
+                    if (ctx) {
+                        new Chart(ctx, {
+                            type: 'line',
+                            data: {
+                                labels: stats.hourly_data.map(d => d.hour),
+                                datasets: [{
+                                    label: 'ترافیک (MB)',
+                                    data: stats.hourly_data.map(d => d.traffic),
+                                    borderColor: '#f59e0b',
+                                    backgroundColor: 'rgba(245, 158, 11, 0.1)',
+                                    fill: true,
+                                    tension: 0.4
+                                }]
+                            },
+                            options: {
+                                responsive: true,
+                                maintainAspectRatio: false,
+                                plugins: {
+                                    legend: {
+                                        labels: { color: '#e5e5e5' }
+                                    }
+                                },
+                                scales: {
+                                    x: {
+                                        ticks: { color: '#a0a0a0' }
+                                    },
+                                    y: {
+                                        ticks: { color: '#a0a0a0' }
+                                    }
+                                }
+                            }
+                        });
+                    }
+                }
+            } catch (error) {
+                console.error('Dashboard error:', error);
+            }
         }
         
-        function renderLinks() {
-            const tbody = document.getElementById('linksBody');
-            const names = Object.keys(linksData);
-            if (names.length === 0) {
-                tbody.innerHTML = '<tr><td colspan="7" style="text-align:center; color:var(--text-muted);">هیچ اینباندی وجود ندارد</td></tr>';
-                return;
-            }
-            let filtered = names;
-            if (currentFilter !== 'all') {
-                filtered = names.filter(n => linksData[n].protocol === currentFilter);
-            }
-            let html = '';
-            for (const name of filtered) {
-                const link = linksData[name];
-                const isActive = link.active !== false;
-                const isExp = link.expires_at ? new Date(link.expires_at) < new Date() : false;
-                const status = isActive && !isExp ? 'فعال' : (isExp ? 'منقضی' : 'غیرفعال');
-                const statusClass = isActive && !isExp ? 'active' : 'inactive';
-                html += `<tr>
-                    <td><strong>${name}</strong></td>
-                    <td>${(link.protocol || 'vless').toUpperCase()}</td>
-                    <td>${formatBytes(link.used || 0)}</td>
-                    <td>${link.limit > 0 ? formatBytes(link.limit) : '♾️'}</td>
-                    <td>${formatDate(link.expires_at)}</td>
-                    <td><span class="status-badge ${statusClass}">${status}</span></td>
-                    <td>
-                        <button class="btn-sm primary" onclick="copyLink('${name}')">📋 کپی</button>
-                        <button class="btn-sm ${isActive ? 'danger' : 'success'}" onclick="toggleLink('${name}')">${isActive ? '⏹️' : '▶️'}</button>
-                        <button class="btn-sm danger" onclick="deleteLink('${name}')">🗑️</button>
-                    </td>
-                </tr>`;
-            }
-            tbody.innerHTML = html;
+        // ============ صفحه اینباندها ============
+        function initInbounds() {
+            // بارگذاری لیست اینباندها
+            loadInboundsList();
+            
+            // دکمه ایجاد اینباند
+            document.getElementById('createInboundBtn')?.addEventListener('click', () => {
+                showCreateInboundModal();
+            });
         }
         
-        function filterLinks(protocol) {
-            currentFilter = protocol;
-            document.querySelectorAll('.hex-card').forEach(el => el.style.borderColor = 'var(--border-color)');
-            document.querySelectorAll('.hex-card').forEach(el => {
-                if (el.textContent.includes(protocol === 'all' ? 'همه' : protocol.toUpperCase())) {
-                    el.style.borderColor = 'var(--honey)';
+        async function loadInboundsList() {
+            try {
+                const response = await fetch('/api/links');
+                if (!response.ok) throw new Error('خطا در دریافت لیست');
+                const links = await response.json();
+                
+                const tbody = document.getElementById('inboundsTableBody');
+                if (!tbody) return;
+                
+                if (!links || links.length === 0) {
+                    tbody.innerHTML = `<tr><td colspan="7" class="text-center text-gray-500 py-8">هیچ اینباندی وجود ندارد</td></tr>`;
+                    return;
+                }
+                
+                let html = '';
+                links.forEach(link => {
+                    html += `
+                        <tr>
+                            <td><span class="font-bold">${link.name}</span></td>
+                            <td>${getStatusBadge(link.active)}</td>
+                            <td>${formatBytes(link.used_bytes || 0)}</td>
+                            <td>${link.limit_gb ? formatBytes(link.limit_gb * 1024**3) : 'نامحدود'}</td>
+                            <td>${formatDate(link.expires_at)}</td>
+                            <td>
+                                <button onclick="copyConfig('${link.uid}')" class="text-amber-400 hover:text-amber-300 mx-1" title="کپی کانفیگ">
+                                    <i class="fas fa-copy"></i>
+                                </button>
+                                <button onclick="showQR('${link.uid}')" class="text-amber-400 hover:text-amber-300 mx-1" title="QR Code">
+                                    <i class="fas fa-qrcode"></i>
+                                </button>
+                                <button onclick="editInbound('${link.uid}')" class="text-blue-400 hover:text-blue-300 mx-1" title="ویرایش">
+                                    <i class="fas fa-edit"></i>
+                                </button>
+                                <button onclick="deleteInbound('${link.uid}')" class="text-red-400 hover:text-red-300 mx-1" title="حذف">
+                                    <i class="fas fa-trash"></i>
+                                </button>
+                            </td>
+                        </tr>
+                    `;
+                });
+                
+                tbody.innerHTML = html;
+            } catch (error) {
+                console.error('Error loading inbounds:', error);
+                showToast('خطا در دریافت لیست اینباندها', 'error');
+            }
+        }
+        
+        window.copyConfig = function(uid) {
+            fetch(`/api/links/${uid}`)
+                .then(r => r.json())
+                .then(link => {
+                    const domain = document.querySelector('meta[name="domain"]')?.content || 'cbee-panel.onrender.com';
+                    const config = `vless://${uid}@${domain}:443?encryption=none&security=tls&type=ws&host=${domain}&path=/ws/${uid}&sni=${domain}&fp=chrome&alpn=http/1.1#CBee-${link.name}`;
+                    navigator.clipboard.writeText(config).then(() => {
+                        showToast('کانفیگ کپی شد ✅');
+                    }).catch(() => {
+                        // Fallback
+                        const textarea = document.createElement('textarea');
+                        textarea.value = config;
+                        document.body.appendChild(textarea);
+                        textarea.select();
+                        document.execCommand('copy');
+                        document.body.removeChild(textarea);
+                        showToast('کانفیگ کپی شد ✅');
+                    });
+                })
+                .catch(() => showToast('خطا در دریافت کانفیگ', 'error'));
+        };
+        
+        window.showQR = function(uid) {
+            // ایجاد مودال QR
+            const modal = document.getElementById('qrModal');
+            if (!modal) {
+                const div = document.createElement('div');
+                div.id = 'qrModal';
+                div.className = 'modal';
+                div.innerHTML = `
+                    <div class="modal-content text-center">
+                        <h3 class="text-xl font-bold mb-4">QR Code</h3>
+                        <div id="qrCodeContainer" class="flex justify-center my-4"></div>
+                        <button onclick="closeModal('qrModal')" class="btn-bee mt-4">بستن</button>
+                    </div>
+                `;
+                document.body.appendChild(div);
+            }
+            
+            // ساخت QR با استفاده از API
+            const domain = document.querySelector('meta[name="domain"]')?.content || 'cbee-panel.onrender.com';
+            const config = `vless://${uid}@${domain}:443?encryption=none&security=tls&type=ws&host=${domain}&path=/ws/${uid}&sni=${domain}&fp=chrome&alpn=http/1.1#CBee-${uid}`;
+            const qrUrl = `https://api.qrserver.com/v1/create-qr-code/?size=200x200&data=${encodeURIComponent(config)}`;
+            document.getElementById('qrCodeContainer').innerHTML = `<img src="${qrUrl}" alt="QR Code" class="rounded-lg">`;
+            document.getElementById('qrModal').classList.add('active');
+        };
+        
+        window.deleteInbound = function(uid) {
+            if (!confirm('آیا از حذف این اینباند مطمئن هستید؟')) return;
+            
+            fetch(`/api/links/${uid}`, { method: 'DELETE' })
+                .then(r => r.json())
+                .then(data => {
+                    if (data.success) {
+                        showToast('اینباند حذف شد ✅');
+                        loadInboundsList();
+                    } else {
+                        showToast(data.error || 'خطا در حذف', 'error');
+                    }
+                })
+                .catch(() => showToast('خطا در حذف', 'error'));
+        };
+        
+        window.editInbound = function(uid) {
+            // بارگذاری داده‌های اینباند
+            fetch(`/api/links/${uid}`)
+                .then(r => r.json())
+                .then(link => {
+                    showEditInboundModal(link);
+                })
+                .catch(() => showToast('خطا در دریافت اطلاعات', 'error'));
+        };
+        
+        function showCreateInboundModal() {
+            const modal = document.getElementById('inboundModal');
+            if (!modal) {
+                const div = document.createElement('div');
+                div.id = 'inboundModal';
+                div.className = 'modal';
+                div.innerHTML = `
+                    <div class="modal-content">
+                        <h3 class="text-xl font-bold mb-4">ایجاد اینباند جدید</h3>
+                        <form id="inboundForm" class="space-y-4">
+                            <div>
+                                <label class="form-label">نام کاربر</label>
+                                <input type="text" id="inboundName" class="form-input" placeholder="مثال: Ali" required>
+                            </div>
+                            <div>
+                                <label class="form-label">محدودیت حجم (GB)</label>
+                                <input type="number" id="inboundLimit" class="form-input" value="10" min="0">
+                                <small class="text-gray-500">0 = نامحدود</small>
+                            </div>
+                            <div>
+                                <label class="form-label">مدت اعتبار (روز)</label>
+                                <input type="number" id="inboundDays" class="form-input" value="30" min="0">
+                                <small class="text-gray-500">0 = بدون انقضا</small>
+                            </div>
+                            <div class="flex gap-3 mt-4">
+                                <button type="submit" class="btn-bee flex-1">ایجاد</button>
+                                <button type="button" onclick="closeModal('inboundModal')" class="flex-1 bg-gray-700 hover:bg-gray-600 text-white rounded-lg px-4 py-2 transition">انصراف</button>
+                            </div>
+                        </form>
+                    </div>
+                `;
+                document.body.appendChild(div);
+                
+                document.getElementById('inboundForm').addEventListener('submit', async (e) => {
+                    e.preventDefault();
+                    const name = document.getElementById('inboundName').value.trim();
+                    const limit = parseInt(document.getElementById('inboundLimit').value) || 0;
+                    const days = parseInt(document.getElementById('inboundDays').value) || 0;
+                    
+                    if (!name) {
+                        showToast('لطفاً نام کاربر را وارد کنید', 'error');
+                        return;
+                    }
+                    
+                    try {
+                        const response = await fetch('/api/links', {
+                            method: 'POST',
+                            headers: { 'Content-Type': 'application/json' },
+                            body: JSON.stringify({ name, limit_gb: limit, days })
+                        });
+                        const data = await response.json();
+                        
+                        if (data.success) {
+                            showToast('اینباند ایجاد شد ✅');
+                            closeModal('inboundModal');
+                            loadInboundsList();
+                        } else {
+                            showToast(data.error || 'خطا در ایجاد', 'error');
+                        }
+                    } catch (error) {
+                        showToast('خطا در ارتباط با سرور', 'error');
+                    }
+                });
+            }
+            
+            document.getElementById('inboundModal').classList.add('active');
+        }
+        
+        function showEditInboundModal(link) {
+            const modal = document.getElementById('editInboundModal');
+            if (!modal) {
+                const div = document.createElement('div');
+                div.id = 'editInboundModal';
+                div.className = 'modal';
+                div.innerHTML = `
+                    <div class="modal-content">
+                        <h3 class="text-xl font-bold mb-4">ویرایش اینباند</h3>
+                        <form id="editInboundForm" class="space-y-4">
+                            <div>
+                                <label class="form-label">نام کاربر</label>
+                                <input type="text" id="editName" class="form-input" required>
+                            </div>
+                            <div>
+                                <label class="form-label">وضعیت</label>
+                                <select id="editActive" class="form-input">
+                                    <option value="true">فعال</option>
+                                    <option value="false">غیرفعال</option>
+                                </select>
+                            </div>
+                            <div>
+                                <label class="form-label">محدودیت حجم (GB)</label>
+                                <input type="number" id="editLimit" class="form-input" min="0">
+                                <small class="text-gray-500">0 = نامحدود</small>
+                            </div>
+                            <div>
+                                <label class="form-label">مدت اعتبار (روز)</label>
+                                <input type="number" id="editDays" class="form-input" min="0">
+                                <small class="text-gray-500">0 = بدون انقضا</small>
+                            </div>
+                            <div class="flex gap-3 mt-4">
+                                <button type="submit" class="btn-bee flex-1">ذخیره</button>
+                                <button type="button" onclick="closeModal('editInboundModal')" class="flex-1 bg-gray-700 hover:bg-gray-600 text-white rounded-lg px-4 py-2 transition">انصراف</button>
+                            </div>
+                        </form>
+                    </div>
+                `;
+                document.body.appendChild(div);
+                
+                document.getElementById('editInboundForm').addEventListener('submit', async (e) => {
+                    e.preventDefault();
+                    const uid = document.getElementById('editUid').value;
+                    const name = document.getElementById('editName').value.trim();
+                    const active = document.getElementById('editActive').value === 'true';
+                    const limit = parseInt(document.getElementById('editLimit').value) || 0;
+                    const days = parseInt(document.getElementById('editDays').value) || 0;
+                    
+                    if (!name) {
+                        showToast('لطفاً نام کاربر را وارد کنید', 'error');
+                        return;
+                    }
+                    
+                    try {
+                        const response = await fetch(`/api/links/${uid}`, {
+                            method: 'PATCH',
+                            headers: { 'Content-Type': 'application/json' },
+                            body: JSON.stringify({ name, active, limit_gb: limit, days })
+                        });
+                        const data = await response.json();
+                        
+                        if (data.success) {
+                            showToast('اینباند به‌روزرسانی شد ✅');
+                            closeModal('editInboundModal');
+                            loadInboundsList();
+                        } else {
+                            showToast(data.error || 'خطا در به‌روزرسانی', 'error');
+                        }
+                    } catch (error) {
+                        showToast('خطا در ارتباط با سرور', 'error');
+                    }
+                });
+            }
+            
+            document.getElementById('editUid').value = link.uid;
+            document.getElementById('editName').value = link.name;
+            document.getElementById('editActive').value = link.active ? 'true' : 'false';
+            document.getElementById('editLimit').value = link.limit_gb || 0;
+            document.getElementById('editDays').value = link.days || 0;
+            document.getElementById('editInboundModal').classList.add('active');
+        }
+        
+        window.closeModal = function(id) {
+            document.getElementById(id)?.classList.remove('active');
+        };
+        
+        // ============ صفحه آی‌پی تمیز ============
+        function initCleanIP() {
+            loadAddresses();
+            
+            document.getElementById('addAddressForm')?.addEventListener('submit', async (e) => {
+                e.preventDefault();
+                const address = document.getElementById('addressInput').value.trim();
+                if (!address) {
+                    showToast('لطفاً آدرس را وارد کنید', 'error');
+                    return;
+                }
+                
+                try {
+                    const response = await fetch('/api/addresses', {
+                        method: 'POST',
+                        headers: { 'Content-Type': 'application/json' },
+                        body: JSON.stringify({ address })
+                    });
+                    const data = await response.json();
+                    
+                    if (data.success) {
+                        showToast('آدرس اضافه شد ✅');
+                        document.getElementById('addressInput').value = '';
+                        loadAddresses();
+                    } else {
+                        showToast(data.error || 'خطا در افزودن', 'error');
+                    }
+                } catch (error) {
+                    showToast('خطا در ارتباط با سرور', 'error');
                 }
             });
-            renderLinks();
-        }
-        
-        async function createLink(e) {
-            e.preventDefault();
-            const name = document.getElementById('linkName').value.trim();
-            const limit = parseInt(document.getElementById('linkLimit').value) || 0;
-            const days = parseInt(document.getElementById('linkDays').value) || 0;
-            const maxIps = parseInt(document.getElementById('linkMaxIps').value) || 0;
-            const protocol = document.getElementById('linkProtocol').value;
-            const resultDiv = document.getElementById('createResult');
-            if (!name) { resultDiv.innerHTML = '<span style="color:var(--danger);">❌ نام را وارد کنید</span>'; return; }
-            try {
-                const formData = new URLSearchParams();
-                formData.append('name', name);
-                formData.append('limit_gb', String(limit));
-                formData.append('days', String(days));
-                formData.append('max_ips', String(maxIps));
-                formData.append('protocol', protocol);
-                const res = await apiRequest('/api/links', {
-                    method: 'POST',
-                    headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
-                    body: formData.toString()
-                });
-                if (!res) return;
-                const data = await res.json();
-                if (res.ok && data.status === 'ok') {
-                    resultDiv.innerHTML = `<span style="color:var(--success);">✅ اینباند "${name}" ساخته شد!</span><br><small style="color:var(--text-muted);">لینک: <code>${data.share_link || ''}</code></small>`;
-                    closeModal('createModal');
-                    loadLinks();
-                    loadStats();
-                } else {
-                    resultDiv.innerHTML = `<span style="color:var(--danger);">❌ ${data.detail || 'خطا در ساخت'}</span>`;
+            
+            document.getElementById('clearAllAddresses')?.addEventListener('click', async () => {
+                if (!confirm('آیا از حذف تمام آدرس‌ها مطمئن هستید؟')) return;
+                
+                try {
+                    const response = await fetch('/api/addresses', { method: 'DELETE' });
+                    const data = await response.json();
+                    
+                    if (data.success) {
+                        showToast('همه آدرس‌ها حذف شدند ✅');
+                        loadAddresses();
+                    } else {
+                        showToast(data.error || 'خطا در حذف', 'error');
+                    }
+                } catch (error) {
+                    showToast('خطا در ارتباط با سرور', 'error');
                 }
-            } catch(e) {
-                resultDiv.innerHTML = `<span style="color:var(--danger);">❌ خطا: ${e.message}</span>`;
-            }
-        }
-        
-        async function toggleLink(name) {
-            if (!confirm(`تغییر وضعیت "${name}"؟`)) return;
-            try {
-                const link = linksData[name];
-                const newStatus = link.active === false;
-                const formData = new URLSearchParams();
-                formData.append('active', String(newStatus));
-                const res = await apiRequest(`/api/links/${encodeURIComponent(name)}`, {
-                    method: 'PATCH',
-                    headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
-                    body: formData.toString()
-                });
-                if (res && res.ok) { loadLinks(); loadStats(); }
-            } catch(e) { console.error('Error toggling link:', e); }
-        }
-        
-        async function deleteLink(name) {
-            if (!confirm(`آیا از حذف "${name}" مطمئن هستید؟`)) return;
-            try {
-                const res = await apiRequest(`/api/links/${encodeURIComponent(name)}`, { method: 'DELETE' });
-                if (res && res.ok) { loadLinks(); loadStats(); }
-            } catch(e) { console.error('Error deleting link:', e); }
-        }
-        
-        function copyLink(name) {
-            const link = linksData[name];
-            if (!link) return;
-            const domain = window.location.hostname;
-            const protocol = link.protocol || 'vless';
-            let config = '';
-            if (protocol === 'vless') {
-                config = `vless://${link.uid}@${domain}:443?encryption=none&security=tls&type=ws&host=${domain}&path=${link.path || '/ws/'+link.uid}&sni=${domain}&fp=chrome&alpn=http/1.1#SLV-${name}`;
-            } else if (protocol === 'vmess') {
-                const vmessConfig = { v: "2", ps: `SLV-${name}`, add: domain, port: "443", id: link.uid, aid: "0", net: "ws", type: "none", host: domain, path: link.path || '/ws/'+link.uid, tls: "tls" };
-                config = `vmess://${btoa(JSON.stringify(vmessConfig))}`;
-            } else if (protocol === 'trojan') {
-                config = `trojan://${link.uid}@${domain}:443?path=${encodeURIComponent(link.path || '/ws/'+link.uid)}&security=tls&type=ws&host=${domain}&sni=${domain}#SLV-${name}`;
-            }
-            navigator.clipboard.writeText(config).then(() => { alert('✅ لینک کپی شد!'); }).catch(() => { prompt('لینک را کپی کنید:', config); });
-        }
-        
-        function showCreateModal() {
-            document.getElementById('createModal').classList.add('show');
-            document.getElementById('createResult').innerHTML = '';
-            document.getElementById('createForm').reset();
+            });
         }
         
         async function loadAddresses() {
             try {
-                const res = await apiRequest('/api/addresses');
-                if (!res) return;
-                const data = await res.json();
-                addressesData = data.addresses || [];
-                renderAddresses();
-            } catch(e) { console.error('Error loading addresses:', e); }
-        }
-        
-        function renderAddresses() {
-            const tbody = document.getElementById('addressesBody');
-            if (addressesData.length === 0) {
-                tbody.innerHTML = '<tr><td colspan="3" style="text-align:center; color:var(--text-muted);">هیچ آدرسی وجود ندارد</td></tr>';
-                return;
-            }
-            let html = '';
-            for (let i = 0; i < addressesData.length; i++) {
-                html += `<tr><td>${i+1}</td><td><code>${addressesData[i]}</code></td><td><button class="btn-sm danger" onclick="deleteAddress(${i})">🗑️</button></td></tr>`;
-            }
-            tbody.innerHTML = html;
-        }
-        
-        async function addAddress(e) {
-            e.preventDefault();
-            const address = document.getElementById('addressInput').value.trim();
-            const resultDiv = document.getElementById('addressResult');
-            if (!address) { resultDiv.innerHTML = '<span style="color:var(--danger);">❌ آدرس را وارد کنید</span>'; return; }
-            try {
-                const formData = new URLSearchParams();
-                formData.append('address', address);
-                const res = await apiRequest('/api/addresses', {
-                    method: 'POST',
-                    headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
-                    body: formData.toString()
-                });
-                if (!res) return;
-                const data = await res.json();
-                if (res.ok) {
-                    resultDiv.innerHTML = `<span style="color:var(--success);">✅ آدرس "${address}" افزوده شد</span>`;
-                    closeModal('addressModal');
-                    loadAddresses();
-                } else {
-                    resultDiv.innerHTML = `<span style="color:var(--danger);">❌ ${data.detail || 'خطا'}</span>`;
+                const response = await fetch('/api/addresses');
+                if (!response.ok) throw new Error('خطا در دریافت لیست');
+                const addresses = await response.json();
+                
+                const container = document.getElementById('addressesList');
+                if (!container) return;
+                
+                if (!addresses || addresses.length === 0) {
+                    container.innerHTML = '<div class="text-center text-gray-500 py-8">هیچ آدرسی وجود ندارد</div>';
+                    return;
                 }
-            } catch(e) {
-                resultDiv.innerHTML = `<span style="color:var(--danger);">❌ خطا: ${e.message}</span>`;
-            }
-        }
-        
-        async function deleteAddress(index) {
-            if (!confirm(`حذف آدرس "${addressesData[index]}"؟`)) return;
-            try {
-                const res = await apiRequest(`/api/addresses/${index}`, { method: 'DELETE' });
-                if (res && res.ok) loadAddresses();
-            } catch(e) { console.error('Error deleting address:', e); }
-        }
-        
-        async function deleteAllAddresses() {
-            if (!confirm('آیا از حذف همه آدرس‌ها مطمئن هستید؟')) return;
-            try {
-                const res = await apiRequest('/api/addresses', { method: 'DELETE' });
-                if (res && res.ok) loadAddresses();
-            } catch(e) { console.error('Error deleting all addresses:', e); }
-        }
-        
-        function showAddAddressModal() {
-            document.getElementById('addressModal').classList.add('show');
-            document.getElementById('addressResult').innerHTML = '';
-            document.getElementById('addressForm').reset();
-        }
-        
-        async function loadSettings() {
-            try {
-                const res = await apiRequest('/api/settings');
-                if (!res) return;
-                const data = await res.json();
-                document.getElementById('tgToken').value = data.telegram_token || '';
-                document.getElementById('tgAdminId').value = data.telegram_admin_id || '';
-            } catch(e) { console.error('Error loading settings:', e); }
-        }
-        
-        async function saveSettings(e) {
-            e.preventDefault();
-            const token = document.getElementById('tgToken').value.trim();
-            const adminId = document.getElementById('tgAdminId').value.trim();
-            const statusEl = document.getElementById('settingsStatus');
-            try {
-                const formData = new URLSearchParams();
-                formData.append('telegram_token', token);
-                formData.append('telegram_admin_id', adminId);
-                const res = await apiRequest('/api/settings', {
-                    method: 'POST',
-                    headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
-                    body: formData.toString()
+                
+                let html = '<div class="space-y-2">';
+                addresses.forEach((addr, index) => {
+                    html += `
+                        <div class="flex items-center justify-between bg-gray-800/30 rounded-lg px-4 py-3">
+                            <span class="font-mono text-sm">${addr}</span>
+                            <button onclick="deleteAddress(${index})" class="text-red-400 hover:text-red-300 transition">
+                                <i class="fas fa-times"></i>
+                            </button>
+                        </div>
+                    `;
                 });
-                if (!res) return;
-                if (res.ok) { statusEl.textContent = '✅ ذخیره شد'; statusEl.style.color = 'var(--success)'; }
-                else { statusEl.textContent = '❌ خطا'; statusEl.style.color = 'var(--danger)'; }
-            } catch(e) {
-                statusEl.textContent = '❌ خطا در ارتباط';
-                statusEl.style.color = 'var(--danger)';
+                html += '</div>';
+                container.innerHTML = html;
+            } catch (error) {
+                console.error('Error loading addresses:', error);
+                showToast('خطا در دریافت لیست آدرس‌ها', 'error');
             }
         }
         
-        async function changePassword(e) {
-            e.preventDefault();
-            const current = document.getElementById('currentPassword').value;
-            const newPass = document.getElementById('newPassword').value;
-            const statusEl = document.getElementById('passwordStatus');
-            if (!current || !newPass) {
-                statusEl.textContent = '❌ هر دو فیلد را پر کنید';
-                statusEl.style.color = 'var(--danger)';
-                return;
-            }
-            try {
-                const formData = new URLSearchParams();
-                formData.append('current', current);
-                formData.append('new', newPass);
-                const res = await apiRequest('/api/change-password', {
-                    method: 'POST',
-                    headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
-                    body: formData.toString()
-                });
-                if (!res) return;
-                if (res.ok) {
-                    statusEl.textContent = '✅ رمز با موفقیت تغییر کرد';
-                    statusEl.style.color = 'var(--success)';
-                    document.getElementById('passwordForm').reset();
-                } else {
-                    statusEl.textContent = `❌ ${data.detail || 'خطا'}`;
-                    statusEl.style.color = 'var(--danger)';
+        window.deleteAddress = function(index) {
+            if (!confirm('آیا از حذف این آدرس مطمئن هستید؟')) return;
+            
+            fetch(`/api/addresses/${index}`, { method: 'DELETE' })
+                .then(r => r.json())
+                .then(data => {
+                    if (data.success) {
+                        showToast('آدرس حذف شد ✅');
+                        loadAddresses();
+                    } else {
+                        showToast(data.error || 'خطا در حذف', 'error');
+                    }
+                })
+                .catch(() => showToast('خطا در حذف', 'error'));
+        };
+        
+        // ============ صفحه تنظیمات ============
+        function initSettings() {
+            // بارگذاری تنظیمات فعلی
+            fetch('/api/settings')
+                .then(r => r.json())
+                .then(data => {
+                    document.getElementById('tgToken').value = data.telegram_token || '';
+                    document.getElementById('tgAdminId').value = data.telegram_admin_id || '';
+                    document.getElementById('botLang').value = data.bot_lang || 'fa';
+                })
+                .catch(() => showToast('خطا در دریافت تنظیمات', 'error'));
+            
+            document.getElementById('settingsForm')?.addEventListener('submit', async (e) => {
+                e.preventDefault();
+                const token = document.getElementById('tgToken').value.trim();
+                const adminId = document.getElementById('tgAdminId').value.trim();
+                const lang = document.getElementById('botLang').value;
+                
+                try {
+                    const response = await fetch('/api/settings', {
+                        method: 'POST',
+                        headers: { 'Content-Type': 'application/json' },
+                        body: JSON.stringify({ telegram_token: token, telegram_admin_id: adminId, bot_lang: lang })
+                    });
+                    const data = await response.json();
+                    
+                    if (data.success) {
+                        showToast('تنظیمات ذخیره شد ✅');
+                    } else {
+                        showToast(data.error || 'خطا در ذخیره', 'error');
+                    }
+                } catch (error) {
+                    showToast('خطا در ارتباط با سرور', 'error');
                 }
-            } catch(e) {
-                statusEl.textContent = '❌ خطا در ارتباط';
-                statusEl.style.color = 'var(--danger)';
-            }
+            });
         }
         
-        function closeModal(id) { document.getElementById(id).classList.remove('show'); }
-        document.querySelectorAll('.modal-overlay').forEach(el => {
-            el.addEventListener('click', function(e) { if (e.target === this) this.classList.remove('show'); });
+        // ============ صفحه امنیت ============
+        function initSecurity() {
+            document.getElementById('changePasswordForm')?.addEventListener('submit', async (e) => {
+                e.preventDefault();
+                const current = document.getElementById('currentPassword').value;
+                const newPass = document.getElementById('newPassword').value;
+                const confirm = document.getElementById('confirmPassword').value;
+                
+                if (newPass !== confirm) {
+                    showToast('رمزهای جدید مطابقت ندارند', 'error');
+                    return;
+                }
+                
+                if (newPass.length < 6) {
+                    showToast('رمز عبور باید حداقل ۶ کاراکتر باشد', 'error');
+                    return;
+                }
+                
+                try {
+                    const response = await fetch('/api/change-password', {
+                        method: 'POST',
+                        headers: { 'Content-Type': 'application/json' },
+                        body: JSON.stringify({ current_password: current, new_password: newPass })
+                    });
+                    const data = await response.json();
+                    
+                    if (data.success) {
+                        showToast('رمز عبور با موفقیت تغییر کرد ✅');
+                        document.getElementById('changePasswordForm').reset();
+                    } else {
+                        showToast(data.error || 'خطا در تغییر رمز', 'error');
+                    }
+                } catch (error) {
+                    showToast('خطا در ارتباط با سرور', 'error');
+                }
+            });
+        }
+        
+        // ============ صفحه ترافیک ============
+        function initTraffic() {
+            // بارگذاری آمار ترافیک
+            fetch('/api/stats')
+                .then(r => r.json())
+                .then(stats => {
+                    document.getElementById('totalTraffic').textContent = formatBytes(stats.total_traffic || 0);
+                    document.getElementById('activeConnections').textContent = stats.active_connections || 0;
+                    document.getElementById('totalInbounds').textContent = stats.total_links || 0;
+                    
+                    // نمایش لیست کاربران با مصرف
+                    if (stats.links) {
+                        let html = '';
+                        stats.links.forEach(link => {
+                            html += `
+                                <div class="flex items-center justify-between glass-card mb-2">
+                                    <span class="font-bold">${link.name}</span>
+                                    <span>${formatBytes(link.used_bytes || 0)}</span>
+                                </div>
+                            `;
+                        });
+                        document.getElementById('trafficList').innerHTML = html || '<div class="text-center text-gray-500">هیچ داده‌ای وجود ندارد</div>';
+                    }
+                })
+                .catch(() => showToast('خطا در دریافت آمار', 'error'));
+        }
+        
+        // ============ بارگذاری اولیه ============
+        document.addEventListener('DOMContentLoaded', () => {
+            // تشخیص صفحه فعلی از URL
+            const path = window.location.pathname;
+            if (path === '/login') return;
+            
+            let page = 'dashboard';
+            if (path.includes('/inbounds')) page = 'inbounds';
+            else if (path.includes('/traffic')) page = 'traffic';
+            else if (path.includes('/clean-ip')) page = 'clean-ip';
+            else if (path.includes('/settings')) page = 'settings';
+            else if (path.includes('/security')) page = 'security';
+            
+            loadPage(page);
         });
         
-        async function logout() {
-            try { await apiRequest('/api/logout', { method: 'POST' }); } catch(e) {}
-            window.location.href = '/login';
-        }
-        
-        document.addEventListener('DOMContentLoaded', function() {
-            loadStats();
-            loadLinks();
-            loadAddresses();
-            loadSettings();
-            setInterval(loadStats, 10000);
+        // ============ بستن مودال با کلیک خارج ============
+        document.addEventListener('click', (e) => {
+            if (e.target.classList.contains('modal')) {
+                e.target.classList.remove('active');
+            }
         });
     </script>
+    
+    <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
 </body>
 </html>
 """
 
-# ==================== مسیرهای صفحات HTML ====================
+# ============ روت‌های FastAPI ============
 
 @app.get("/")
-async def root():
-    return RedirectResponse(url="/login")
+async def root(request: Request):
+    """صفحه اصلی"""
+    if not check_auth(request):
+        return RedirectResponse(url="/login")
+    return HTMLResponse(HTML_TEMPLATE)
 
 @app.get("/login")
-async def login_page():
-    return HTMLResponse(LOGIN_HTML)
+async def login_page(request: Request):
+    """صفحه ورود"""
+    if check_auth(request):
+        return RedirectResponse(url="/")
+    
+    return HTMLResponse("""
+    <!DOCTYPE html>
+    <html lang="fa" dir="rtl">
+    <head>
+        <meta charset="UTF-8">
+        <meta name="viewport" content="width=device-width, initial-scale=1.0">
+        <title>🐝 ورود | CBee Panel</title>
+        <script src="https://cdn.tailwindcss.com"></script>
+        <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.5.1/css/all.min.css">
+        <style>
+            @import url('https://fonts.googleapis.com/css2?family=Vazirmatn:wght@400;700;900&display=swap');
+            * { margin: 0; padding: 0; box-sizing: border-box; }
+            body {
+                font-family: 'Vazirmatn', sans-serif;
+                background: #0a0a0a;
+                min-height: 100vh;
+                display: flex;
+                align-items: center;
+                justify-content: center;
+                padding: 20px;
+                position: relative;
+                overflow: hidden;
+            }
+            .hex-bg {
+                position: fixed;
+                top: 0; left: 0; width: 100%; height: 100%;
+                opacity: 0.05;
+                background-image: 
+                    linear-gradient(30deg, #f59e0b 12%, transparent 12.5%, transparent 87%, #f59e0b 87.5%),
+                    linear-gradient(150deg, #f59e0b 12%, transparent 12.5%, transparent 87%, #f59e0b 87.5%),
+                    linear-gradient(30deg, #f59e0b 12%, transparent 12.5%, transparent 87%, #f59e0b 87.5%),
+                    linear-gradient(150deg, #f59e0b 12%, transparent 12.5%, transparent 87%, #f59e0b 87.5%);
+                background-size: 80px 140px;
+                background-position: 0 0, 0 0, 40px 70px, 40px 70px;
+                z-index: 0;
+            }
+            .login-box {
+                background: rgba(255, 255, 255, 0.05);
+                backdrop-filter: blur(20px);
+                border: 1px solid rgba(245, 158, 11, 0.2);
+                border-radius: 32px;
+                padding: 48px;
+                width: 100%;
+                max-width: 420px;
+                text-align: center;
+                position: relative;
+                z-index: 1;
+                animation: slideUp 0.6s ease;
+            }
+            @keyframes slideUp {
+                from { transform: translateY(30px); opacity: 0; }
+                to { transform: translateY(0); opacity: 1; }
+            }
+            .bee-icon {
+                font-size: 4rem;
+                display: inline-block;
+                animation: buzz 3s infinite ease-in-out;
+                margin-bottom: 12px;
+            }
+            @keyframes buzz {
+                0%, 100% { transform: translateY(0) rotate(0deg) scale(1); }
+                25% { transform: translateY(-5px) rotate(5deg) scale(1.05); }
+                50% { transform: translateY(0) rotate(-3deg) scale(0.95); }
+                75% { transform: translateY(-3px) rotate(3deg) scale(1.02); }
+            }
+            .login-title {
+                font-size: 2rem;
+                font-weight: 900;
+                background: linear-gradient(135deg, #fbbf24, #f59e0b);
+                -webkit-background-clip: text;
+                -webkit-text-fill-color: transparent;
+                background-clip: text;
+                margin-bottom: 8px;
+            }
+            .login-subtitle { color: #a0a0a0; margin-bottom: 32px; }
+            .form-input {
+                width: 100%;
+                padding: 14px 18px;
+                background: rgba(255, 255, 255, 0.05);
+                border: 1px solid rgba(255, 255, 255, 0.1);
+                border-radius: 14px;
+                color: #e5e5e5;
+                transition: all 0.3s;
+                outline: none;
+                font-size: 1rem;
+            }
+            .form-input:focus {
+                border-color: #f59e0b;
+                box-shadow: 0 0 0 3px rgba(245, 158, 11, 0.1);
+            }
+            .form-input::placeholder { color: #666; }
+            .btn-bee {
+                width: 100%;
+                background: linear-gradient(135deg, #f59e0b, #b45309);
+                color: #000;
+                font-weight: 700;
+                padding: 14px;
+                border: none;
+                border-radius: 14px;
+                cursor: pointer;
+                transition: all 0.3s ease;
+                box-shadow: 0 4px 20px rgba(245, 158, 11, 0.3);
+                font-size: 1rem;
+            }
+            .btn-bee:hover {
+                transform: scale(1.02);
+                box-shadow: 0 8px 30px rgba(245, 158, 11, 0.5);
+            }
+            .btn-bee:active { transform: scale(0.98); }
+            .toast {
+                position: fixed;
+                bottom: 24px;
+                right: 24px;
+                z-index: 200;
+                background: #1a1a1a;
+                border: 1px solid rgba(245, 158, 11, 0.3);
+                border-radius: 16px;
+                padding: 16px 24px;
+                color: #e5e5e5;
+                box-shadow: 0 8px 32px rgba(0,0,0,0.5);
+                transform: translateY(100px);
+                opacity: 0;
+                transition: all 0.4s cubic-bezier(0.4, 0, 0.2, 1);
+                display: flex;
+                align-items: center;
+                gap: 12px;
+            }
+            .toast.show { transform: translateY(0); opacity: 1; }
+            .toast.error { border-color: #ef4444; }
+        </style>
+    </head>
+    <body>
+        <div class="hex-bg"></div>
+        
+        <div class="login-box">
+            <div class="bee-icon">🐝</div>
+            <h1 class="login-title">CBee Panel</h1>
+            <p class="login-subtitle">ورود به پنل مدیریت</p>
+            
+            <form id="loginForm" class="space-y-4">
+                <div>
+                    <input type="password" id="password" class="form-input" placeholder="رمز عبور" required autofocus>
+                </div>
+                <button type="submit" class="btn-bee">
+                    <i class="fas fa-sign-in-alt ml-2"></i> ورود
+                </button>
+            </form>
+            
+            <p class="text-xs text-gray-600 mt-6">نسخه 2.0.0 • طراحی حرفه‌ای</p>
+        </div>
+        
+        <div id="toast" class="toast error">
+            <i class="fas fa-exclamation-circle"></i>
+            <span id="toastMessage">خطا</span>
+        </div>
+        
+        <script>
+            document.getElementById('loginForm').addEventListener('submit', async (e) => {
+                e.preventDefault();
+                const password = document.getElementById('password').value;
+                
+                try {
+                    const response = await fetch('/api/login', {
+                        method: 'POST',
+                        headers: { 'Content-Type': 'application/json' },
+                        body: JSON.stringify({ password })
+                    });
+                    const data = await response.json();
+                    
+                    if (data.success) {
+                        window.location.href = '/';
+                    } else {
+                        showToast('رمز عبور اشتباه است');
+                        document.getElementById('password').value = '';
+                        document.getElementById('password').focus();
+                    }
+                } catch (error) {
+                    showToast('خطا در ارتباط با سرور');
+                }
+            });
+            
+            function showToast(message) {
+                const toast = document.getElementById('toast');
+                const toastMessage = document.getElementById('toastMessage');
+                toastMessage.textContent = message;
+                toast.classList.add('show');
+                setTimeout(() => toast.classList.remove('show'), 3000);
+            }
+            
+            document.addEventListener('keydown', (e) => {
+                if (e.key === 'Enter') document.getElementById('loginForm').dispatchEvent(new Event('submit'));
+            });
+        </script>
+    </body>
+    </html>
+    """)
 
-@app.get("/dashboard")
-async def dashboard_page(user: str = Depends(require_admin)):
-    return HTMLResponse(DASHBOARD_HTML)
+@app.get("/api/page/{page}")
+async def get_page(request: Request, page: str):
+    """API برای بارگذاری صفحات (AJAX)"""
+    if not check_auth(request):
+        return JSONResponse({"error": "Unauthorized"}, status_code=401)
+    
+    pages = {
+        "dashboard": """
+        <div class="space-y-6">
+            <div class="flex items-center justify-between">
+                <h2 class="text-2xl font-bold"><i class="fas fa-chart-pie text-amber-400 ml-2"></i>داشبورد</h2>
+                <span class="text-sm text-gray-500">به‌روزرسانی لحظه‌ای</span>
+            </div>
+            
+            <div class="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-4 gap-4">
+                <div class="glass-card">
+                    <div class="flex items-center justify-between">
+                        <span class="text-gray-400">کاربران</span>
+                        <i class="fas fa-users text-amber-400 text-2xl"></i>
+                    </div>
+                    <div class="counter text-3xl font-black mt-2" id="statUsers">0</div>
+                </div>
+                <div class="glass-card">
+                    <div class="flex items-center justify-between">
+                        <span class="text-gray-400">فعال</span>
+                        <i class="fas fa-check-circle text-green-400 text-2xl"></i>
+                    </div>
+                    <div class="counter text-3xl font-black mt-2" id="statActive">0</div>
+                </div>
+                <div class="glass-card">
+                    <div class="flex items-center justify-between">
+                        <span class="text-gray-400">ترافیک کل</span>
+                        <i class="fas fa-chart-bar text-amber-400 text-2xl"></i>
+                    </div>
+                    <div class="counter text-3xl font-black mt-2" id="statTraffic">0 B</div>
+                </div>
+                <div class="glass-card">
+                    <div class="flex items-center justify-between">
+                        <span class="text-gray-400">سیستم</span>
+                        <i class="fas fa-microchip text-amber-400 text-2xl"></i>
+                    </div>
+                    <div class="flex gap-4 mt-2">
+                        <div><span class="text-gray-500 text-sm">CPU</span><br><span id="statCPU" class="font-bold">0%</span></div>
+                        <div><span class="text-gray-500 text-sm">RAM</span><br><span id="statMemory" class="font-bold">0%</span></div>
+                        <div><span class="text-gray-500 text-sm">آپتایم</span><br><span id="statUptime" class="font-bold">0s</span></div>
+                    </div>
+                </div>
+            </div>
+            
+            <div class="glass-card">
+                <h3 class="text-lg font-bold mb-4"><i class="fas fa-chart-line text-amber-400 ml-2"></i>نمودار ترافیک ساعتی</h3>
+                <div style="height: 300px;">
+                    <canvas id="trafficChart"></canvas>
+                </div>
+            </div>
+        </div>
+        """,
+        
+        "inbounds": """
+        <div class="space-y-6">
+            <div class="flex items-center justify-between flex-wrap gap-3">
+                <h2 class="text-2xl font-bold"><i class="fas fa-users text-amber-400 ml-2"></i>مدیریت اینباندها</h2>
+                <button id="createInboundBtn" class="btn-bee">
+                    <i class="fas fa-plus ml-2"></i> ایجاد اینباند جدید
+                </button>
+            </div>
+            
+            <div class="table-container">
+                <table>
+                    <thead>
+                        <tr>
+                            <th>نام</th>
+                            <th>وضعیت</th>
+                            <th>مصرف</th>
+                            <th>سقف حجم</th>
+                            <th>انقضا</th>
+                            <th>عملیات</th>
+                        </tr>
+                    </thead>
+                    <tbody id="inboundsTableBody">
+                        <tr><td colspan="6" class="text-center text-gray-500 py-8">در حال بارگذاری...</td></tr>
+                    </tbody>
+                </table>
+            </div>
+            
+            <input type="hidden" id="editUid">
+        </div>
+        """,
+        
+        "traffic": """
+        <div class="space-y-6">
+            <h2 class="text-2xl font-bold"><i class="fas fa-chart-line text-amber-400 ml-2"></i>آمار ترافیک</h2>
+            
+            <div class="grid grid-cols-1 md:grid-cols-3 gap-4">
+                <div class="glass-card">
+                    <div class="text-gray-400">ترافیک کل</div>
+                    <div class="text-2xl font-bold text-amber-400" id="totalTraffic">0 B</div>
+                </div>
+                <div class="glass-card">
+                    <div class="text-gray-400">اتصالات فعال</div>
+                    <div class="text-2xl font-bold text-green-400" id="activeConnections">0</div>
+                </div>
+                <div class="glass-card">
+                    <div class="text-gray-400">تعداد اینباندها</div>
+                    <div class="text-2xl font-bold text-blue-400" id="totalInbounds">0</div>
+                </div>
+            </div>
+            
+            <div class="glass-card">
+                <h3 class="text-lg font-bold mb-4">مصرف هر کاربر</h3>
+                <div id="trafficList" class="space-y-2"></div>
+            </div>
+        </div>
+        """,
+        
+        "clean-ip": """
+        <div class="space-y-6">
+            <h2 class="text-2xl font-bold"><i class="fas fa-network-wired text-amber-400 ml-2"></i>مدیریت آی‌پی تمیز</h2>
+            
+            <div class="glass-card">
+                <h3 class="text-lg font-bold mb-4">افزودن آدرس جدید</h3>
+                <form id="addAddressForm" class="flex gap-3 flex-wrap">
+                    <input type="text" id="addressInput" class="form-input flex-1 min-w-[200px]" placeholder="مثال: 104.21.0.1 یا example.com" required>
+                    <button type="submit" class="btn-bee"><i class="fas fa-plus ml-2"></i>افزودن</button>
+                    <button type="button" id="clearAllAddresses" class="bg-red-500/20 hover:bg-red-500/30 text-red-400 rounded-lg px-4 py-2 transition">
+                        <i class="fas fa-trash ml-2"></i>حذف همه
+                    </button>
+                </form>
+            </div>
+            
+            <div class="glass-card">
+                <h3 class="text-lg font-bold mb-4">لیست آدرس‌ها</h3>
+                <div id="addressesList" class="space-y-2"></div>
+            </div>
+        </div>
+        """,
+        
+        "settings": """
+        <div class="space-y-6">
+            <h2 class="text-2xl font-bold"><i class="fas fa-cog text-amber-400 ml-2"></i>تنظیمات ربات تلگرام</h2>
+            
+            <div class="glass-card max-w-2xl">
+                <form id="settingsForm" class="space-y-4">
+                    <div>
+                        <label class="form-label">توکن ربات تلگرام</label>
+                        <input type="text" id="tgToken" class="form-input" placeholder="مثال: 1234567890:ABCdefGHIjklMNOpqrsTUVwxyz">
+                        <small class="text-gray-500">دریافت از @BotFather</small>
+                    </div>
+                    <div>
+                        <label class="form-label">آیدی عددی ادمین</label>
+                        <input type="text" id="tgAdminId" class="form-input" placeholder="مثال: 123456789">
+                        <small class="text-gray-500">دریافت از @userinfobot</small>
+                    </div>
+                    <div>
+                        <label class="form-label">زبان ربات</label>
+                        <select id="botLang" class="form-input">
+                            <option value="fa">فارسی</option>
+                            <option value="en">English</option>
+                        </select>
+                    </div>
+                    <button type="submit" class="btn-bee"><i class="fas fa-save ml-2"></i>ذخیره تنظیمات</button>
+                </form>
+            </div>
+        </div>
+        """,
+        
+        "security": """
+        <div class="space-y-6">
+            <h2 class="text-2xl font-bold"><i class="fas fa-shield-alt text-amber-400 ml-2"></i>امنیت</h2>
+            
+            <div class="glass-card max-w-2xl">
+                <h3 class="text-lg font-bold mb-4">تغییر رمز عبور</h3>
+                <form id="changePasswordForm" class="space-y-4">
+                    <div>
+                        <label class="form-label">رمز فعلی</label>
+                        <input type="password" id="currentPassword" class="form-input" required>
+                    </div>
+                    <div>
+                        <label class="form-label">رمز جدید</label>
+                        <input type="password" id="newPassword" class="form-input" required minlength="6">
+                    </div>
+                    <div>
+                        <label class="form-label">تکرار رمز جدید</label>
+                        <input type="password" id="confirmPassword" class="form-input" required minlength="6">
+                    </div>
+                    <button type="submit" class="btn-bee"><i class="fas fa-key ml-2"></i>تغییر رمز</button>
+                </form>
+            </div>
+        </div>
+        """
+    }
+    
+    return HTMLResponse(pages.get(page, "<div class='text-center text-gray-500 py-8'>صفحه یافت نشد</div>"))
 
-# ==================== Keep-Alive ====================
+# ============ API Routes ============
+
+@app.post("/api/login")
+async def api_login(request: Request):
+    """ورود به پنل"""
+    data = await request.json()
+    password = data.get("password", "")
+    
+    if verify_password(password, hash_password(ADMIN_PASSWORD)):
+        session_id = secrets.token_urlsafe(32)
+        SESSIONS[session_id] = "admin"
+        
+        response = JSONResponse({"success": True})
+        response.set_cookie("session_id", session_id, httponly=True, max_age=3600*24*7)
+        return response
+    
+    return JSONResponse({"success": False, "error": "رمز عبور اشتباه است"}, status_code=401)
+
+@app.post("/api/logout")
+async def api_logout(request: Request):
+    """خروج از پنل"""
+    session_id = request.cookies.get("session_id")
+    if session_id and session_id in SESSIONS:
+        del SESSIONS[session_id]
+    
+    response = RedirectResponse(url="/login")
+    response.delete_cookie("session_id")
+    return response
+
+@app.get("/api/me")
+async def api_me(request: Request):
+    """بررسی وضعیت احراز هویت"""
+    if check_auth(request):
+        return JSONResponse({"authenticated": True, "user": get_current_user(request)})
+    return JSONResponse({"authenticated": False}, status_code=401)
+
+@app.post("/api/change-password")
+async def api_change_password(request: Request):
+    """تغییر رمز عبور"""
+    if not check_auth(request):
+        return JSONResponse({"success": False, "error": "Unauthorized"}, status_code=401)
+    
+    data = await request.json()
+    current = data.get("current_password", "")
+    new_pass = data.get("new_password", "")
+    
+    if not verify_password(current, hash_password(ADMIN_PASSWORD)):
+        return JSONResponse({"success": False, "error": "رمز فعلی اشتباه است"})
+    
+    if len(new_pass) < 6:
+        return JSONResponse({"success": False, "error": "رمز جدید باید حداقل ۶ کاراکتر باشد"})
+    
+    # در محیط واقعی باید رمز را در env یا دیتابیس ذخیره کرد
+    # اینجا فقط برای نمایش است
+    return JSONResponse({"success": True})
+
+# ============ API اینباندها ============
+
+@app.get("/api/links")
+async def api_get_links(request: Request):
+    """دریافت لیست تمام اینباندها"""
+    if not check_auth(request):
+        return JSONResponse({"error": "Unauthorized"}, status_code=401)
+    
+    links_list = []
+    for uid, link in LINKS.items():
+        link_copy = link.copy()
+        link_copy["uid"] = uid
+        links_list.append(link_copy)
+    
+    return JSONResponse(links_list)
+
+@app.get("/api/links/{uid}")
+async def api_get_link(request: Request, uid: str):
+    """دریافت اطلاعات یک اینباند"""
+    if not check_auth(request):
+        return JSONResponse({"error": "Unauthorized"}, status_code=401)
+    
+    if uid not in LINKS:
+        return JSONResponse({"error": "اینباند یافت نشد"}, status_code=404)
+    
+    link = LINKS[uid].copy()
+    link["uid"] = uid
+    return JSONResponse(link)
+
+@app.post("/api/links")
+async def api_create_link(request: Request):
+    """ایجاد اینباند جدید"""
+    if not check_auth(request):
+        return JSONResponse({"error": "Unauthorized"}, status_code=401)
+    
+    data = await request.json()
+    name = data.get("name", "").strip()
+    limit_gb = data.get("limit_gb", 0)
+    days = data.get("days", 30)
+    
+    if not name:
+        return JSONResponse({"success": False, "error": "نام کاربر الزامی است"})
+    
+    # بررسی تکراری نبودن نام
+    for link in LINKS.values():
+        if link["name"].lower() == name.lower():
+            return JSONResponse({"success": False, "error": "این نام قبلاً استفاده شده است"})
+    
+    uid = generate_uid()
+    now = int(time.time())
+    expires_at = now + (days * 24 * 3600) if days > 0 else None
+    
+    LINKS[uid] = {
+        "name": name,
+        "active": True,
+        "created_at": now,
+        "expires_at": expires_at,
+        "limit_bytes": limit_gb * 1024**3 if limit_gb > 0 else 0,
+        "used_bytes": 0,
+        "max_connections": 0,
+        "days": days,
+        "limit_gb": limit_gb
+    }
+    
+    save_db()
+    return JSONResponse({"success": True, "uid": uid})
+
+@app.patch("/api/links/{uid}")
+async def api_update_link(request: Request, uid: str):
+    """به‌روزرسانی اینباند"""
+    if not check_auth(request):
+        return JSONResponse({"error": "Unauthorized"}, status_code=401)
+    
+    if uid not in LINKS:
+        return JSONResponse({"error": "اینباند یافت نشد"}, status_code=404)
+    
+    data = await request.json()
+    link = LINKS[uid]
+    
+    if "name" in data:
+        link["name"] = data["name"].strip()
+    if "active" in data:
+        link["active"] = bool(data["active"])
+    if "limit_gb" in data:
+        limit_gb = int(data["limit_gb"])
+        link["limit_bytes"] = limit_gb * 1024**3 if limit_gb > 0 else 0
+        link["limit_gb"] = limit_gb
+    if "days" in data:
+        days = int(data["days"])
+        if days > 0:
+            link["expires_at"] = int(time.time()) + (days * 24 * 3600)
+        else:
+            link["expires_at"] = None
+        link["days"] = days
+    if "reset_usage" in data and data["reset_usage"]:
+        link["used_bytes"] = 0
+    
+    save_db()
+    return JSONResponse({"success": True})
+
+@app.delete("/api/links/{uid}")
+async def api_delete_link(request: Request, uid: str):
+    """حذف اینباند"""
+    if not check_auth(request):
+        return JSONResponse({"error": "Unauthorized"}, status_code=401)
+    
+    if uid not in LINKS:
+        return JSONResponse({"error": "اینباند یافت نشد"}, status_code=404)
+    
+    del LINKS[uid]
+    save_db()
+    return JSONResponse({"success": True})
+
+# ============ API آی‌پی تمیز ============
+
+@app.get("/api/addresses")
+async def api_get_addresses(request: Request):
+    """دریافت لیست آدرس‌های تمیز"""
+    if not check_auth(request):
+        return JSONResponse({"error": "Unauthorized"}, status_code=401)
+    
+    return JSONResponse(CUSTOM_ADDRESSES)
+
+@app.post("/api/addresses")
+async def api_add_address(request: Request):
+    """افزودن آدرس تمیز"""
+    if not check_auth(request):
+        return JSONResponse({"error": "Unauthorized"}, status_code=401)
+    
+    data = await request.json()
+    address = data.get("address", "").strip()
+    
+    if not address:
+        return JSONResponse({"success": False, "error": "آدرس الزامی است"})
+    
+    if address in CUSTOM_ADDRESSES:
+        return JSONResponse({"success": False, "error": "این آدرس قبلاً اضافه شده است"})
+    
+    CUSTOM_ADDRESSES.append(address)
+    save_db()
+    return JSONResponse({"success": True})
+
+@app.delete("/api/addresses/{index}")
+async def api_delete_address(request: Request, index: int):
+    """حذف یک آدرس تمیز"""
+    if not check_auth(request):
+        return JSONResponse({"error": "Unauthorized"}, status_code=401)
+    
+    if index < 0 or index >= len(CUSTOM_ADDRESSES):
+        return JSONResponse({"error": "آدرس یافت نشد"}, status_code=404)
+    
+    del CUSTOM_ADDRESSES[index]
+    save_db()
+    return JSONResponse({"success": True})
+
+@app.delete("/api/addresses")
+async def api_delete_all_addresses(request: Request):
+    """حذف همه آدرس‌های تمیز"""
+    if not check_auth(request):
+        return JSONResponse({"error": "Unauthorized"}, status_code=401)
+    
+    CUSTOM_ADDRESSES.clear()
+    save_db()
+    return JSONResponse({"success": True})
+
+# ============ API تنظیمات ============
+
+@app.get("/api/settings")
+async def api_get_settings(request: Request):
+    """دریافت تنظیمات"""
+    if not check_auth(request):
+        return JSONResponse({"error": "Unauthorized"}, status_code=401)
+    
+    return JSONResponse({
+        "telegram_token": CONFIG.get("telegram_token", ""),
+        "telegram_admin_id": CONFIG.get("telegram_admin_id", ""),
+        "bot_lang": CONFIG.get("bot_lang", "fa")
+    })
+
+@app.post("/api/settings")
+async def api_update_settings(request: Request):
+    """به‌روزرسانی تنظیمات"""
+    if not check_auth(request):
+        return JSONResponse({"error": "Unauthorized"}, status_code=401)
+    
+    data = await request.json()
+    
+    if "telegram_token" in data:
+        CONFIG["telegram_token"] = data["telegram_token"].strip()
+    if "telegram_admin_id" in data:
+        CONFIG["telegram_admin_id"] = data["telegram_admin_id"].strip()
+    if "bot_lang" in data:
+        CONFIG["bot_lang"] = data["bot_lang"]
+    
+    save_db()
+    
+    # راه‌اندازی مجدد ربات (در این نمونه فقط لاگ می‌کنیم)
+    logger.info("✅ تنظیمات ربات تلگرام به‌روزرسانی شد")
+    
+    return JSONResponse({"success": True})
+
+# ============ API آمار ============
+
+@app.get("/api/stats")
+async def api_stats(request: Request):
+    """دریافت آمار سرور"""
+    if not check_auth(request):
+        return JSONResponse({"error": "Unauthorized"}, status_code=401)
+    
+    total_links = len(LINKS)
+    active_links = sum(1 for l in LINKS.values() if l.get("active", False))
+    total_traffic = sum(l.get("used_bytes", 0) for l in LINKS.values())
+    
+    # آمار سیستم
+    cpu_percent = psutil.cpu_percent(interval=0.5)
+    memory = psutil.virtual_memory()
+    
+    # آپتایم
+    with open("/proc/uptime", "r") as f:
+        uptime_seconds = int(float(f.read().split()[0]))
+    uptime = f"{uptime_seconds // 3600}h {(uptime_seconds % 3600) // 60}m"
+    
+    # داده‌های ساعتی (نمونه)
+    hourly_data = []
+    for i in range(12):
+        hour = f"{i:02d}:00"
+        hourly_data.append({
+            "hour": hour,
+            "traffic": round(total_traffic * (0.5 + 0.5 * (i / 12)), 0) / (1024**2)
+        })
+    
+    links_list = []
+    for uid, link in LINKS.items():
+        links_list.append({
+            "uid": uid,
+            "name": link.get("name", "Unknown"),
+            "used_bytes": link.get("used_bytes", 0)
+        })
+    
+    return JSONResponse({
+        "total_links": total_links,
+        "active_links": active_links,
+        "total_traffic": total_traffic,
+        "cpu_percent": round(cpu_percent, 1),
+        "memory_percent": round(memory.percent, 1),
+        "uptime": uptime,
+        "active_connections": sum(len(ws) for ws in ACTIVE_WEBSOCKETS.values()),
+        "hourly_data": hourly_data,
+        "links": links_list
+    })
+
+@app.get("/health")
+async def health():
+    """بررسی سلامت سرور"""
+    return JSONResponse({"status": "healthy", "timestamp": int(time.time())})
+
+# ============ WebSocket برای لاگ‌ها ============
+
+@app.websocket("/ws/live-logs")
+async def websocket_logs(websocket: WebSocket):
+    """استریم لاگ زنده"""
+    await websocket.accept()
+    try:
+        # ارسال لاگ‌های نمونه
+        for i in range(5):
+            await websocket.send_text(json.dumps({
+                "time": datetime.now().isoformat(),
+                "level": "info",
+                "message": f"لاگ نمونه #{i+1} - اتصال برقرار شد"
+            }))
+            await asyncio.sleep(0.5)
+        
+        # حلقه اصلی
+        while True:
+            await asyncio.sleep(1)
+            await websocket.send_text(json.dumps({
+                "time": datetime.now().isoformat(),
+                "level": "debug",
+                "message": f"پینگ زنده - {int(time.time())}"
+            }))
+    except WebSocketDisconnect:
+        logger.info("WebSocket لاگ قطع شد")
+
+# ============ WebSocket پراکسی VLESS ============
+
+@app.websocket("/ws/{uuid}")
+async def websocket_proxy(websocket: WebSocket, uuid: str):
+    """پروکسی WebSocket برای VLESS"""
+    await websocket.accept()
+    
+    # بررسی وجود اینباند
+    if uuid not in LINKS:
+        await websocket.close(code=1008, reason="Invalid UUID")
+        return
+    
+    link = LINKS[uuid]
+    
+    # بررسی فعال بودن
+    if not link.get("active", False):
+        await websocket.close(code=1008, reason="Inbound is disabled")
+        return
+    
+    # بررسی انقضا
+    expires_at = link.get("expires_at")
+    if expires_at and int(time.time()) > expires_at:
+        await websocket.close(code=1008, reason="Inbound expired")
+        return
+    
+    # بررسی محدودیت حجم
+    limit_bytes = link.get("limit_bytes", 0)
+    if limit_bytes > 0 and link.get("used_bytes", 0) >= limit_bytes:
+        await websocket.close(code=1008, reason="Quota exceeded")
+        return
+    
+    # اضافه کردن به اتصالات فعال
+    if uuid not in ACTIVE_WEBSOCKETS:
+        ACTIVE_WEBSOCKETS[uuid] = set()
+    ACTIVE_WEBSOCKETS[uuid].add(websocket)
+    
+    try:
+        # اینجا باید پروکسی واقعی به سرور هدف پیاده‌سازی شود
+        # برای نمونه فقط اکو می‌کنیم
+        while True:
+            data = await websocket.receive_text()
+            await websocket.send_text(f"Echo: {data}")
+            
+            # به‌روزرسانی مصرف (نمونه)
+            link["used_bytes"] = link.get("used_bytes", 0) + len(data)
+            save_db()
+            
+    except WebSocketDisconnect:
+        pass
+    finally:
+        if uuid in ACTIVE_WEBSOCKETS:
+            ACTIVE_WEBSOCKETS[uuid].discard(websocket)
+            if not ACTIVE_WEBSOCKETS[uuid]:
+                del ACTIVE_WEBSOCKETS[uuid]
+
+# ============ WebSocket پشتیبان برای لاگ‌ها ============
+
+@app.websocket("/ws/live-logs")
+async def websocket_live_logs(websocket: WebSocket):
+    """ارسال لاگ‌های زنده"""
+    await websocket.accept()
+    try:
+        while True:
+            await websocket.send_text(json.dumps({
+                "time": datetime.now().isoformat(),
+                "level": "info",
+                "message": f"سیستم فعال است - {int(time.time())}"
+            }))
+            await asyncio.sleep(2)
+    except WebSocketDisconnect:
+        pass
+
+# ============ Subscription ============
+
+@app.get("/sub/{uid}")
+async def get_subscription(uid: str):
+    """دریافت لینک اشتراک"""
+    if uid not in LINKS:
+        raise HTTPException(status_code=404, detail="Inbound not found")
+    
+    domain = get_domain()
+    if CUSTOM_ADDRESSES:
+        domain = CUSTOM_ADDRESSES[0]
+    
+    link = LINKS[uid]
+    config = generate_vless_config(uid, link["name"], domain)
+    
+    import base64
+    encoded = base64.b64encode(config.encode()).decode()
+    return Response(content=encoded, media_type="text/plain")
+
+# ============ اجرای برنامه ============
 
 @app.on_event("startup")
-async def start_keep_alive():
-    async def keep_alive():
-        while True:
-            await asyncio.sleep(600)
-            try:
-                async with httpx.AsyncClient() as client:
-                    await client.get(f"http://localhost:{os.environ.get('PORT', 8000)}/health")
-                logger.info("💓 Keep-alive ping sent")
-            except Exception as e:
-                logger.error(f"Keep-alive error: {e}")
-    
-    asyncio.create_task(keep_alive())
+async def startup_event():
+    """رویداد استارت برنامه"""
+    load_db()
+    logger.info("🐝 CBee Panel v2.0.0 راه‌اندازی شد")
+    logger.info(f"📊 {len(LINKS)} اینباند بارگذاری شد")
+    logger.info(f"🌐 آدرس: http://localhost:{PORT}")
 
-# ==================== اجرا ====================
+@app.on_event("shutdown")
+async def shutdown_event():
+    """رویداد توقف برنامه"""
+    save_db()
+    logger.info("👋 CBee Panel متوقف شد")
 
 if __name__ == "__main__":
-    port = int(os.environ.get("PORT", 8000))
-    uvicorn.run(app, host="0.0.0.0", port=port)
+    import uvicorn
+    uvicorn.run(app, host="0.0.0.0", port=PORT)
