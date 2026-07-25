@@ -1,0 +1,12 @@
+fastapi==0.104.1
+uvicorn[standard]==0.24.0
+httpx==0.25.1
+aiofiles>=23.2.1
+websockets==12.0
+httpx[http2]
+python-multipart==0.0.9
+psutil==5.9.8
+pyTelegramBotAPI==4.15.0
+python-jose[cryptography]==3.3.0
+passlib[bcrypt]==1.7.4
+python-dotenv==1.0.1
